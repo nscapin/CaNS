@@ -102,15 +102,23 @@ logical, protected :: is_impdiff = .false., is_impdiff_1d = .false., &
                       is_poisson_pcr_tdma = .false., &
                       is_fast_mom_kernels = .true., &
                       is_gridpoint_natural_channel = .false.
+!
+! i/o backend parameters
+!
+character(len=16), protected :: io_backend = 'mpiio'
+character(len=6) , protected :: io_ext = '.bin'
+logical          , protected :: is_use_compression = .false.
+
 contains
   subroutine read_input(myid)
     use, intrinsic :: iso_fortran_env, only: iostat_end
     use mpi
     implicit none
-    character(len=*), parameter :: input_file = 'input.nml'
+    character(len=255) :: input_file,filename
     integer, intent(in) :: myid
-    integer :: iunit,ierr
+    integer :: iunit,ierr,numarg
     character(len=1024) :: c_iomsg
+    logical :: is_io_fallback
     namelist /dns/ &
                   ng, &
                   l, &
@@ -130,6 +138,9 @@ contains
                   gacc, &
                   nscal, &
                   dims,ipencil_axis
+    namelist /io/  &
+                  io_backend, &
+                  is_use_compression
 #if defined(_OPENACC) && !defined(_USE_DIEZDECOMP)
     namelist /cudecomp/ &
                        cudecomp_t_comm_backend,cudecomp_is_t_enable_nccl,cudecomp_is_t_enable_nvshmem, &
@@ -157,17 +168,30 @@ contains
     dt_f = -1.
     gacc(:) = 0.
     nscal = 0
+    !
+    ! use a custom input file if one was provided on the command line
+    !
+    input_file = 'input.nml'
+    numarg = command_argument_count()
+    if(numarg == 1) then
+      call get_command_argument(1,filename)
+      input_file = trim(filename)
+    end if
     open(newunit=iunit,file=input_file,status='old',action='read',iostat=ierr,iomsg=c_iomsg)
       if(ierr /= 0) then
-        if(myid == 0) print*, 'Error reading the input file: ', trim(c_iomsg)
+        if(myid == 0) print*, 'ERROR: reading the input file: ', trim(c_iomsg)
         if(myid == 0) print*, 'Aborting...'
         call MPI_FINALIZE(ierr)
         close(iunit)
         error stop
       end if
+      !
+      ! read `dns` namelist
+      !
+      rewind(iunit)
       read(iunit,nml=dns,iostat=ierr,iomsg=c_iomsg)
       if(ierr /= 0) then
-        if(myid == 0) print*, 'Error reading `dns` namelist: ', trim(c_iomsg)
+        if(myid == 0) print*, 'ERROR: reading `dns` namelist: ', trim(c_iomsg)
         if(myid == 0) print*, 'Aborting...'
         call MPI_FINALIZE(ierr)
         close(iunit)
@@ -179,7 +203,7 @@ contains
       visc = visci**(-1)
       if(all([1,2,3] /= ipencil_axis)) then
         ipencil_axis = 1 ! default to one
-        if(myid == 0) print*, 'Warning: prescribed value of `ipencil_axis` different than 1/2/3.', trim(c_iomsg)
+        if(myid == 0) print*, 'Warning: prescribed value of `ipencil_axis` is different from 1/2/3.'
         if(myid == 0) print*, 'Defaulting to `ipencil_axis = 1` (x-aligned pencils)...'
       end if
 #if defined(_OPENACC)
@@ -198,14 +222,14 @@ contains
       rewind(iunit)
       read(iunit,nml=cudecomp,iostat=ierr,iomsg=c_iomsg)
       if(ierr /= 0) then
-        if(myid == 0) print*, 'Error reading cudecomp namelist: ', trim(c_iomsg)
+        if(myid == 0) print*, 'ERROR: reading `cudecomp` namelist: ', trim(c_iomsg)
         if(myid == 0) print*, 'Aborting...'
         call MPI_FINALIZE(ierr)
         close(iunit)
         error stop
       end if
       !
-      if(cudecomp_t_comm_backend >= 1 .and. cudecomp_t_comm_backend <= 7) then
+      if(cudecomp_t_comm_backend >= 1 .and. cudecomp_t_comm_backend <= 8) then
         cudecomp_is_t_comm_autotune = .false. ! do not autotune if backend is prescribed
         select case(cudecomp_t_comm_backend)
         case(1)
@@ -222,11 +246,13 @@ contains
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_NVSHMEM
         case(7)
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_NVSHMEM_PL
+        case(8)
+          cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_NVSHMEM_SM
         case default
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_MPI_P2P
         end select
       end if
-      if(cudecomp_h_comm_backend >= 1 .and. cudecomp_h_comm_backend <= 4) then
+      if(cudecomp_h_comm_backend >= 1 .and. cudecomp_h_comm_backend <= 5) then
         cudecomp_is_h_comm_autotune = .false. ! do not autotune if backend is prescribed
         select case(cudecomp_h_comm_backend)
         case(1)
@@ -275,7 +301,7 @@ contains
         rewind(iunit)
         read(iunit,nml=scalar,iostat=ierr,iomsg=c_iomsg)
         if(ierr /= 0) then
-          if(myid == 0) print*, 'Error reading scalar namelist: ', trim(c_iomsg)
+          if(myid == 0) print*, 'ERROR: reading `scalar` namelist: ', trim(c_iomsg)
           if(myid == 0) print*, 'Aborting...'
           call MPI_FINALIZE(ierr)
           close(iunit)
@@ -289,7 +315,7 @@ contains
       alpha_max = alpha_max**(-1)
       if(is_boussinesq_buoyancy) then
         if(nscal == 0) then
-          if(myid == 0) print*, 'error reading the input file: `is_boussinesq_buoyancy = T` requires `nscal > 0`.'
+          if(myid == 0) print*, 'ERROR: reading the input file: `is_boussinesq_buoyancy = T` requires `nscal > 0`.'
           if(myid == 0) print*, 'Aborting...'
           call MPI_FINALIZE(ierr)
           error stop
@@ -301,7 +327,7 @@ contains
       rewind(iunit)
       read(iunit,nml=numerics,iostat=ierr,iomsg=c_iomsg)
       if(ierr /= 0 .and. ierr /= iostat_end) then
-        if(myid == 0) print*, 'Error reading `numerics` namelist: ', trim(c_iomsg)
+        if(myid == 0) print*, 'ERROR: reading `numerics` namelist: ', trim(c_iomsg)
         if(myid == 0) print*, 'Aborting...'
         call MPI_FINALIZE(ierr)
         close(iunit)
@@ -314,11 +340,53 @@ contains
       rewind(iunit)
       read(iunit,nml=other_options,iostat=ierr,iomsg=c_iomsg)
       if(ierr /= 0 .and. ierr /= iostat_end) then
-        if(myid == 0) print*, 'Error reading `other_options` namelist: ', trim(c_iomsg)
+        if(myid == 0) print*, 'ERROR: reading `other_options` namelist: ', trim(c_iomsg)
         if(myid == 0) print*, 'Aborting...'
         call MPI_FINALIZE(ierr)
         close(iunit)
         error stop
+      end if
+      !
+      ! read `io` namelist
+      !
+      rewind(iunit)
+      read(iunit,nml=io,iostat=ierr,iomsg=c_iomsg)
+      if(ierr /= 0 .and. ierr /= iostat_end) then
+        if(myid == 0) print*, 'ERROR: reading `io` namelist: ', trim(c_iomsg)
+        if(myid == 0) print*, 'Aborting...'
+        call MPI_FINALIZE(ierr)
+        close(iunit)
+        error stop
+      end if
+      is_io_fallback = .false.
+      select case(trim(io_backend))
+      case('mpiio')
+        io_ext = '.bin'
+      case('hdf5')
+#if defined(_USE_HDF5)
+        io_ext = '.h5'
+#else
+        if(myid == 0) print*, 'Warning: `io_backend = hdf5` requires an HDF5 build.'
+        is_io_fallback = .true.
+#endif
+      case('adios2')
+#if defined(_USE_ADIOS2)
+        io_ext = '.bp'
+#else
+        if(myid == 0) print*, 'Warning: `io_backend = adios2` requires an ADIOS2 build.'
+        is_io_fallback = .true.
+#endif
+      case default
+        if(myid == 0) print*, 'Warning: unknown `io_backend = ', trim(io_backend), '`.'
+        is_io_fallback = .true.
+      end select
+      if(is_io_fallback) then
+        if(myid == 0) print*, 'Defaulting to `io_backend = mpiio`...'
+        io_backend = 'mpiio'
+        io_ext = '.bin'
+      end if
+      if(is_use_compression .and. trim(io_backend) == 'mpiio') then
+        if(myid == 0) print*, 'Warning: compression is ignored for `io_backend = mpiio`.'
       end if
     close(iunit)
   end subroutine read_input

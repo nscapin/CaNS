@@ -5,7 +5,9 @@
 !
 ! -
 module mod_rk
-  use mod_mom  , only: momx_a,momy_a,momz_a, &
+  use mod_mom  , only: momx_a => momx_a_vv, &
+                       momy_a => momy_a_vv, &
+                       momz_a => momz_a_vv, &
                        momx_d,momy_d,momz_d, &
                        momx_p,momy_p,momz_p, &
                        cmpt_wallshear, &
@@ -19,7 +21,7 @@ module mod_rk
   implicit none
   public rk,rk_scal
   contains
-  subroutine rk(rkpar,n,dli,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f,visc,dt,p, &
+  subroutine rk(rkpar,n,dli,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f,dt,visc,p, &
                 is_forced,velf,bforce,gacc,beta,scalars,dudtrko,dvdtrko,dwdtrko,u,v,w,f)
 #if defined(_OPENACC)
     use mod_common_cudecomp, only: dudtrk_t => work, &
@@ -33,10 +35,10 @@ module mod_rk
     implicit none
     real(rp), intent(in   ), dimension(2)        :: rkpar
     integer , intent(in   ), dimension(3)        :: n
-    real(rp), intent(in   )                      :: visc,dt
     real(rp), intent(in   ), dimension(3)        :: dli
     real(rp), intent(in   ), dimension(0:)       :: dzci,dzfi
     real(rp), intent(in   ), dimension(0:)       :: grid_vol_ratio_c,grid_vol_ratio_f
+    real(rp), intent(in   )                      :: dt,visc
     real(rp), intent(in   ), dimension(0:,0:,0:) :: p
     logical , intent(in   ), dimension(3)        :: is_forced
     real(rp), intent(in   ), dimension(3)        :: velf,bforce
@@ -144,10 +146,10 @@ module mod_rk
           call momy_d_z( n(1),n(2),n(3),dzci  ,dzfi  ,visc,v,dvdtrkd)
           call momz_d_z( n(1),n(2),n(3),dzci  ,dzfi  ,visc,w,dwdtrkd)
         end if
-        call momx_a(n(1),n(2),n(3),dli(1),dli(2),dzfi,u,v,w,dudtrk)
-        call momy_a(n(1),n(2),n(3),dli(1),dli(2),dzfi,u,v,w,dvdtrk)
-        call momz_a(n(1),n(2),n(3),dli(1),dli(2),dzci,u,v,w,dwdtrk)
       end if
+      call momx_a(n(1),n(2),n(3),dli(1),dli(2),dzfi,u,v,w,dudtrk)
+      call momy_a(n(1),n(2),n(3),dli(1),dli(2),dzfi,u,v,w,dvdtrk)
+      call momz_a(n(1),n(2),n(3),dli(1),dli(2),dzci,dzfi,u,v,w,dwdtrk)
     end if
     !
 #if !defined(_LOOP_UNSWITCHING)
@@ -507,7 +509,7 @@ module mod_rk
     end if
   end subroutine cmpt_bulk_forcing
   !
-  subroutine cmpt_bulk_forcing_alternative(rkpar,n,dli,l,dzci,dzfi,visc,dt,is_bound,is_forced,u,v,w,tauxo,tauyo,tauzo,f,is_first)
+  subroutine cmpt_bulk_forcing_alternative(rkpar,n,dli,l,dzci,dzfi,dt,visc,is_bound,is_forced,u,v,w,tauxo,tauyo,tauzo,f,is_first)
     !
     ! computes the pressure gradient to be added to the flow that perfectly balances the wall shear stresses
     ! this effectively prescribes zero net acceleration, which allows to sustain a constant mass flux
@@ -515,9 +517,9 @@ module mod_rk
     implicit none
     real(rp), intent(in), dimension(2) :: rkpar
     integer , intent(in), dimension(3) :: n
-    real(rp), intent(in) :: visc,dt
     real(rp), intent(in   ), dimension(3) :: dli,l
     real(rp), intent(in   ), dimension(0:) :: dzci,dzfi
+    real(rp), intent(in) :: dt,visc
     logical , intent(in   ), dimension(0:1,3)    :: is_bound
     logical , intent(in   ), dimension(3) :: is_forced
     real(rp), intent(in   ), dimension(0:,0:,0:) :: u,v,w

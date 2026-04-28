@@ -7,8 +7,9 @@
 module mod_initmpi
   use mpi
   use decomp_2d
-  use mod_common_mpi, only: myid,ierr,halo,dinfo_ptdma
-  use mod_param     , only: ipencil => ipencil_axis,is_poisson_pcr_tdma
+  use decomp_2d_constants, only: D2D_LOG_QUIET
+  use mod_common_mpi     , only: myid,ierr,halo,dinfo_ptdma
+  use mod_param          , only: ipencil => ipencil_axis,is_poisson_pcr_tdma
   use mod_types
 #if defined(_OPENACC)
   use openacc
@@ -158,7 +159,9 @@ module mod_initmpi
     atune_conf%autotune_halo_backend = cudecomp_is_h_comm_autotune
     atune_conf%disable_nccl_backends    = .not.cudecomp_is_t_enable_nccl
     atune_conf%disable_nvshmem_backends = .not.cudecomp_is_t_enable_nvshmem
-    if(all(conf_poi%transpose_comm_backend /= [CUDECOMP_TRANSPOSE_COMM_NVSHMEM,CUDECOMP_TRANSPOSE_COMM_NVSHMEM_PL])) then
+    if(all(conf_poi%transpose_comm_backend /= [CUDECOMP_TRANSPOSE_COMM_NVSHMEM, &
+                                               CUDECOMP_TRANSPOSE_COMM_NVSHMEM_PL, &
+                                               CUDECOMP_TRANSPOSE_COMM_NVSHMEM_SM])) then
       !
       ! disable NVSHMEM halo backend autotuning when NVSHMEM is NOT used for transposes
       !
@@ -181,6 +184,7 @@ module mod_initmpi
     call diezdecompGridDescCreate(gd_poi_io,dims,ng,ng,is_axis_contiguous,periods,ipencil)
 #endif
 #endif
+    decomp_log = D2D_LOG_QUIET
     call decomp_2d_init(ng(1),ng(2),ng(3),dims(1),dims(2),periods)
     if(is_poisson_pcr_tdma) then
       call decomp_info_init(ng(1),ng(2),2*dims(2),dinfo_ptdma)

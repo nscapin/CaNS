@@ -63,7 +63,7 @@ contains
     ! estimate GPU memory footprint, assuming one MPI task <-> one GPU
     !
     use mod_types, only: i8,rp
-    use mod_param, only: is_impdiff,is_impdiff_1d
+    use mod_param, only: is_impdiff,is_impdiff_1d,is_poisson_pcr_tdma
     integer, intent(in), dimension(3) :: n,n_z
     integer, intent(in) :: nscal
     integer :: nh(3)
@@ -74,7 +74,7 @@ contains
     ! 1. 'main' arrays: u,v,w,p,pp,scalars
     !
     nh(:) = 1
-    itotal = itotal + product(n(:)+2*nh(:))*rp_size*(5+nscal)
+    itotal = itotal + product(int(n(:),i8)+2*int(nh(:),i8))*rp_size*(5+nscal)
     !
     ! 2. grids arrays: zc,zf,dzc,dzf,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f (tiny footprint)
     !
@@ -86,10 +86,12 @@ contains
     !
     block
       integer(i8) :: itemp1,itemp1_(3),itemp2,itemp3
-      itemp1_(:) = [n_z(2)*n_z(3)*2,n_z(1)*n_z(3)*2,n_z(1)*n_z(2)*2]
+      itemp1_(:) = [int(n_z(2),i8)*int(n_z(3),i8)*2, &
+                    int(n_z(1),i8)*int(n_z(3),i8)*2, &
+                    int(n_z(1),i8)*int(n_z(2),i8)*2]
       itemp1 = sum(itemp1_(:))   ! rhs
-      itemp2 = product(n_z(1:2)) ! lambdaxy
-      itemp3 = n_z(3)*3          ! a,b,c
+      itemp2 = product(int(n_z(1:2),i8)) ! lambdaxy
+      itemp3 = int(n_z(3),i8)*3          ! a,b,c
       if(.not.is_impdiff) then
         !
         ! rhsbp, lambdaxyp, ap,bp,cp
@@ -110,7 +112,7 @@ contains
     !
     ! 4. prediction velocity arrays arrays d[u,v,w]dtrk_t, d[u,v,w]dtrko_t + scalars equivalent
     !
-    itemp  = product(n(:))*rp_size
+    itemp  = product(int(n(:),i8))*rp_size
     itotal = itotal + itemp*(2*(3+nscal))
     if(is_impdiff) then
       itotal = itotal + itemp*(1*(3+nscal))
@@ -120,11 +122,13 @@ contains
     !    taken directly from `mod_common_cudecomp`
     !
     block
-      use mod_common_cudecomp, only: work,work_halo,solver_buf_0,solver_buf_1,pz_aux_1,pz_aux_2
-      itemp = storage_size(work        ,i8)*size(work        ) + storage_size(work_halo   ,i8)*size(work_halo   ) + &
-              storage_size(solver_buf_0,i8)*size(solver_buf_0) + storage_size(solver_buf_1,i8)*size(solver_buf_1) + &
-              storage_size(pz_aux_1    ,i8)*size(pz_aux_1    ) + storage_size(pz_aux_2    ,i8)*size(pz_aux_2    )
-      itotal = itotal + itemp/8
+      use mod_common_cudecomp, only: work,work_halo,work_ptdma,solver_buf_0,solver_buf_1,pz_aux_1,pz_aux_2
+      itemp = size(work        ,kind=i8) + size(work_halo   ,kind=i8) + &
+              size(solver_buf_0,kind=i8) + size(solver_buf_1,kind=i8)
+      if(allocated(pz_aux_1)) itemp = itemp + size(pz_aux_1,kind=i8)
+      if(allocated(pz_aux_2)) itemp = itemp + size(pz_aux_2,kind=i8)
+      if(is_poisson_pcr_tdma) itemp = itemp + size(work_ptdma,kind=i8)
+      itotal = itotal + itemp*rp_size
     end block
   end function device_memory_footprint
 #endif

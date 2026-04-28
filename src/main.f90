@@ -38,7 +38,7 @@ program cans
   use mod_fft            , only: fftini,fftend
   use mod_fillps         , only: fillps
   use mod_initflow       , only: initflow,initscal
-  use mod_initgrid       , only: initgrid
+  use mod_initgrid       , only: initgrid,save_grid
   use mod_initmpi        , only: initmpi
   use mod_initsolver     , only: initsolver
   use mod_load           , only: load_one
@@ -59,7 +59,7 @@ program cans
                                  dims, &
                                  nb,is_bound, &
                                  rkcoeff,small, &
-                                 datadir, &
+                                 datadir,io_ext, &
                                  read_input, &
                                  is_debug,is_debug_poisson, &
                                  is_timing, &
@@ -76,7 +76,6 @@ program cans
   use mod_workspaces     , only: init_wspace_arrays,set_cufft_wspace,cudecomp_finalize
   use mod_common_cudecomp, only: istream_acc_queue_1,ap_z_ptdma
 #endif
-  use mod_timer          , only: timer_tic,timer_toc,timer_print
   use mod_updatep        , only: updatep
   use mod_utils          , only: bulk_mean
 #if defined(_OPENACC)
@@ -114,9 +113,10 @@ program cans
   type(rhs_bound) :: rhsbu,rhsbv,rhsbw
   !
   real(rp) :: dt,dti,dt_cfl,time,dtrk,dtrki,divtot,divmax
-  integer :: irk,istep
+  integer :: irk,istep,iunit
   real(rp), allocatable, dimension(:) :: dzc  ,dzf  ,zc  ,zf  ,dzci  ,dzfi, &
                                          dzc_g,dzf_g,zc_g,zf_g,dzci_g,dzfi_g, &
+                                         xc_g,xf_g,yc_g,yf_g, &
                                          grid_vol_ratio_c,grid_vol_ratio_f
   real(rp) :: meanvelu,meanvelv,meanvelw
   real(rp), dimension(3) :: dpdl
@@ -193,6 +193,8 @@ program cans
            zf_g(  0:ng(3)+1), &
            dzci_g(0:ng(3)+1), &
            dzfi_g(0:ng(3)+1))
+  allocate(xc_g(0:ng(1)+1),xf_g(0:ng(1)+1), &
+           yc_g(0:ng(2)+1),yf_g(0:ng(2)+1))
   allocate(grid_vol_ratio_c,mold=dzc)
   allocate(grid_vol_ratio_f,mold=dzf)
   allocate(rhsbp%x(n(2),n(3),0:1), &
@@ -222,13 +224,14 @@ program cans
   !$acc enter data copyin(scalars(:))
   !
   if(is_debug) then
-    if(myid == 0) print*, 'This executable of CaNS was built with compiler: ', compiler_version()
-    if(myid == 0) print*, 'Using the options: ', compiler_options()
+    if(myid == 0) print*, '*** CaNS build information ***'
+    if(myid == 0) print*, 'Compiler version: ', compiler_version()
+    if(myid == 0) print*, 'Compiler options: ', compiler_options()
     block
       character(len=MPI_MAX_LIBRARY_VERSION_STRING) :: mpi_version
       integer :: ilen
       call MPI_GET_LIBRARY_VERSION(mpi_version,ilen,ierr)
-      if(myid == 0) print*, 'MPI Version: ', trim(mpi_version)
+      if(myid == 0) print*, 'MPI version: ', trim(mpi_version)
     end block
     if(myid == 0) print*, ''
   end if
@@ -236,20 +239,21 @@ program cans
   if(myid == 0) print*, '*** Beginning of simulation ***'
   if(myid == 0) print*, '*******************************'
   if(myid == 0) print*, ''
-  call initgrid(gtype,ng(3),gr,l(3),dzc_g,dzf_g,zc_g,zf_g)
+  call initgrid(gtype,ng(3),gr,l(3),dzc_g,dzf_g,zc_g,zf_g,cbcpre(0,3)//cbcpre(1,3) == 'PP')
+  do kk=0,ng(1)+1
+    xc_g(kk) = (kk-0.5_rp)*dl(1)
+    xf_g(kk) = (kk-1.0_rp)*dl(1)
+  end do
+  do kk=0,ng(2)+1
+    yc_g(kk) = (kk-0.5_rp)*dl(2)
+    yf_g(kk) = (kk-1.0_rp)*dl(2)
+  end do
   if(myid == 0) then
-    open(99,file=trim(datadir)//'grid.bin',action='write',form='unformatted',access='stream',status='replace')
-    write(99) dzc_g(1:ng(3)),dzf_g(1:ng(3)),zc_g(1:ng(3)),zf_g(1:ng(3))
-    close(99)
-    open(99,file=trim(datadir)//'grid.out')
-    do kk=0,ng(3)+1
-      write(99,*) 0.,zf_g(kk),zc_g(kk),dzf_g(kk),dzc_g(kk)
-    end do
-    close(99)
-    open(99,file=trim(datadir)//'geometry.out')
-      write(99,*) ng(1),ng(2),ng(3)
-      write(99,*) l(1),l(2),l(3)
-    close(99)
+    open(newunit=iunit,file=trim(datadir)//'geometry.out',status='replace')
+    write(iunit,*) ng(1),ng(2),ng(3)
+    write(iunit,*) l(1),l(2),l(3)
+    close(iunit)
+    call save_grid(datadir,'grid',ng,zc_g,zf_g,dzc_g,dzf_g)
   end if
   !$acc enter data copyin(lo,hi,n) async
   !$acc enter data copyin(bforce,dl,dli,l) async
@@ -350,18 +354,18 @@ program cans
                   device_memory_footprint(n,n_z,nscal)/(1._sp*1024**3), ' ***'
 #endif
   if(is_debug_poisson) then
-    call test_sanity_solver(ng,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,dli,dzc,dzf,dzci,dzfi,dzci_g,dzfi_g, &
+    call test_sanity_solver(ng,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,l,dli,dzc,dzf,dzci,dzfi,dzci_g,dzfi_g, &
                             nb,is_bound,cbcvel,cbcpre,bcvel,bcpre)
   end if
   !
   allocate(io_vars(4+nscal),c_io_vars(4+nscal)) ! u,v,w,p,scalars
-  io_vars(1)%arr => u; c_io_vars(1) = '_u'
-  io_vars(2)%arr => v; c_io_vars(2) = '_v'
-  io_vars(3)%arr => w; c_io_vars(3) = '_w'
-  io_vars(4)%arr => p; c_io_vars(4) = '_p'
+  io_vars(1)%arr => u; c_io_vars(1) = 'u'
+  io_vars(2)%arr => v; c_io_vars(2) = 'v'
+  io_vars(3)%arr => w; c_io_vars(3) = 'w'
+  io_vars(4)%arr => p; c_io_vars(4) = 'p'
   do iscal=1,nscal
     write(scalnum,'(i3.3)') iscal
-    io_vars(4+iscal)%arr => scalars(iscal)%val; c_io_vars(4+iscal) = '_s_'//scalnum
+    io_vars(4+iscal)%arr => scalars(iscal)%val; c_io_vars(4+iscal) = 's_'//scalnum
   end do
   !
   is_ptdma_update_p = .true.
@@ -374,11 +378,11 @@ program cans
       s => scalars(iscal)
       call initscal(s%ini,s%bc,ng,lo,l,dl,zc,dzf,s%alpha,s%is_forced,s%scalf,s%val)
     end do
-    if(myid == 0) print*, '*** Initial condition succesfully set ***'
+    if(myid == 0) print*, '*** Initial condition successfully set ***'
   else
     do is=1,4+nscal
-      call load_one('r',trim(datadir)//'fld'//trim(c_io_vars(is))//'.bin', &
-                    MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,time,istep)
+      call load_one('r',trim(datadir)//'fld_'//trim(c_io_vars(is))//trim(io_ext), &
+                    MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep)
     end do
     if(myid == 0) print*, '*** Checkpoint loaded at time = ', time, 'time step = ', istep, '. ***'
   end if
@@ -446,7 +450,7 @@ program cans
         end if
         call boundp(s%cbc,n,s%bc,nb,is_bound,dl,dzc,s%val)
       end do
-      call rk(rkcoeff(:,irk),n,dli,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f,visc,dt,p, &
+      call rk(rkcoeff(:,irk),n,dli,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f,dt,visc,p, &
               is_forced,velf,bforce,gacc,beta,scalars,dudtrko,dvdtrko,dwdtrko,u,v,w,f)
       call bulk_forcing(n,is_forced,f,u,v,w)
       dpdl(:) = dpdl(:) + f(:)
@@ -496,8 +500,8 @@ program cans
         kill = .true.
       end if
       dti = 1./dt
-      call chkdiv(lo,hi,dli,dzfi,u,v,w,divtot,divmax)
-      if(myid == 0) print*, 'Total divergence = ', divtot, '| Maximum divergence = ', divmax
+      call chkdiv(lo,hi,l,dli,dzfi,u,v,w,divtot,divmax)
+      if(myid == 0) print*, 'Velocity divergence norms: Mean = ', divtot, '| Maximum = ', divmax
       if(.not.is_mask_divergence_check) then
         if(divmax > small.or.is_nan(divtot)) then
           if(myid == 0) print*, 'ERROR: maximum divergence is too large.'
@@ -596,15 +600,32 @@ program cans
         !$acc update self(scalars(iscal)%val)
       end do
       do is=1,4+nscal
-        call load_one('w',trim(datadir)//trim(filename)//trim(c_io_vars(is))//'.bin', &
-                      MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,time,istep)
+        select case(trim(c_io_vars(is)))
+        case('u')
+          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
+                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+                        xf_g,yc_g,zc_g)
+        case('v')
+          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
+                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+                        xc_g,yf_g,zc_g)
+        case('w')
+          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
+                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+                        xc_g,yc_g,zf_g)
+        case default
+          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
+                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+                        xc_g,yc_g,zc_g)
+        end select
       end do
       if(.not.is_overwrite_save) then
         !
-        ! fld_*.bin -> last checkpoint file (symbolic link)
+        ! fld_*.<ext> -> last checkpoint file (symbolic link)
         !
         do is=1,4+nscal
-          call gen_alias(myid,trim(datadir),trim(filename)//trim(c_io_vars(is))//'.bin','fld'//trim(c_io_vars(is))//'.bin')
+          call gen_alias(myid,trim(datadir),trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
+                         'fld_'//trim(c_io_vars(is))//trim(io_ext))
         end do
       end if
       if(myid == 0) print*, '*** Checkpoint saved at time = ', time, 'time step = ', istep, '. ***'
@@ -615,7 +636,7 @@ program cans
       call MPI_ALLREDUCE(dt12,dt12av ,1,MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
       call MPI_ALLREDUCE(dt12,dt12min,1,MPI_REAL_RP,MPI_MIN,MPI_COMM_WORLD,ierr)
       call MPI_ALLREDUCE(dt12,dt12max,1,MPI_REAL_RP,MPI_MAX,MPI_COMM_WORLD,ierr)
-      if(myid == 0) print*, 'Avrg, min & max elapsed time: '
+      if(myid == 0) print*, 'Average, minimum & maximum elapsed time: '
       if(myid == 0) print*, dt12av/(1.*product(dims)),dt12min,dt12max
     end if
   end do
