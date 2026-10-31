@@ -7,7 +7,11 @@
 module mod_param
 use mod_types
 #if defined(_OPENACC) && !defined(_USE_DIEZDECOMP)
+#if defined (_USE_HIP)
+use hipdecomp
+#else
 use cudecomp
+#endif
 #endif
 implicit none
 public
@@ -15,11 +19,6 @@ public
 ! parameters
 !
 real(rp), parameter :: pi = acos(-1._rp)
-#if !defined(_EPS_EXACT_ZERO) /* recommended */
-real(rp), parameter :: eps = epsilon(1._rp)
-#else
-real(rp), parameter :: eps = 0._rp
-#endif
 real(rp), parameter :: small = epsilon(1._rp)*10**(precision(1._rp)/2)
 character(len=100), parameter :: datadir = 'data/'
 real(rp), parameter, dimension(2,3) :: rkcoeff = reshape([32._rp/60._rp,  0._rp        , &
@@ -45,6 +44,7 @@ logical , protected, dimension(3) :: stop_type
 logical , protected :: restart,is_overwrite_save
 integer , protected :: nsaves_max
 integer , protected :: icheck,iout0d,iout1d,iout2d,iout3d,isave
+real(rp), protected :: tout0d,tout1d,tout2d,tout3d,tsave
 !
 integer , dimension(2) :: dims ! not protected -> overwritten when autotuning
 integer , protected :: ipencil_axis = 1
@@ -59,6 +59,7 @@ real(rp)        , protected, dimension(0:1,3)   ::   bcpre
 real(rp), protected, dimension(3) :: bforce
 logical , protected, dimension(3) :: is_forced
 real(rp), protected, dimension(3) :: velf
+logical , protected :: is_bulk_forcing_wall_shear
 !
 real(rp), protected, dimension(3) :: dl,dli
 real(rp), protected :: visc
@@ -99,9 +100,14 @@ logical, protected :: is_debug = .true., is_debug_poisson = .false., &
 ! other options: numerics
 !
 logical, protected :: is_impdiff = .false., is_impdiff_1d = .false., &
-                      is_poisson_pcr_tdma = .false., &
+                      is_poisson_dtdma = .false., &
                       is_fast_mom_kernels = .true., &
                       is_gridpoint_natural_channel = .false.
+!
+! halo widths of the velocity, pressure, and scalar fields; the grid arrays take the largest
+! (one layer suffices for CaNS; extensions with wider stencils may increase them here)
+!
+integer, parameter :: nh_v = 1, nh_p = 1, nh_s = 1, nh_g = max(nh_v,nh_p,nh_s)
 !
 ! i/o backend parameters
 !
@@ -131,10 +137,12 @@ contains
                   stop_type, &
                   restart,is_overwrite_save,nsaves_max, &
                   icheck,iout0d,iout1d,iout2d,iout3d,isave, &
+                  tout0d,tout1d,tout2d,tout3d,tsave, &
                   cbcvel,cbcpre,bcvel,bcpre, &
                   bforce, &
                   is_forced, &
                   velf, &
+                  is_bulk_forcing_wall_shear, &
                   gacc, &
                   nscal, &
                   dims,ipencil_axis
@@ -156,7 +164,7 @@ contains
                      is_boussinesq_buoyancy
     namelist /numerics/ &
                        is_impdiff,is_impdiff_1d, &
-                       is_poisson_pcr_tdma, &
+                       is_poisson_dtdma, &
                        is_gridpoint_natural_channel
     namelist /other_options/ &
                             is_debug,is_debug_poisson, &
@@ -166,6 +174,8 @@ contains
     ! defaults
     !
     dt_f = -1.
+    tout0d = 0.; tout1d = 0.; tout2d = 0.; tout3d = 0.; tsave = 0.
+    is_bulk_forcing_wall_shear = .false.
     gacc(:) = 0.
     nscal = 0
     !
@@ -246,8 +256,10 @@ contains
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_NVSHMEM
         case(7)
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_NVSHMEM_PL
+#if !defined(_USE_HIP)
         case(8)
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_NVSHMEM_SM
+#endif
         case default
           cudecomp_t_comm_backend = CUDECOMP_TRANSPOSE_COMM_MPI_P2P
         end select
@@ -307,11 +319,11 @@ contains
           close(iunit)
           error stop
         end if
+        alpha_max = minval(alphai(1:nscal))
       else
         nscal = 0 ! negative values equivalent to nscal = 0
+        alpha_max = huge(1._rp)
       end if
-      alpha_max = huge(1._rp)
-      alpha_max = minval(alphai(1:nscal))
       alpha_max = alpha_max**(-1)
       if(is_boussinesq_buoyancy) then
         if(nscal == 0) then

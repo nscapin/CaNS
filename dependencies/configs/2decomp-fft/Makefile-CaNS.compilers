@@ -72,7 +72,12 @@ else ifeq ($(CMP),GNU)
     FFLAGS += -g3 -Og
     FFLAGS += -ffpe-trap=invalid,zero -fcheck=all -fimplicit-none
   else
-    FFLAGS += -O3 -march=native
+    FFLAGS += -O3
+    ifeq ($(strip $(GNU_CPU_TARGET)),)
+      FFLAGS += -march=native
+    else
+      FFLAGS += -march=$(GNU_CPU_TARGET)
+    endif
   endif
   ifeq ($(findstring openmpi,$(shell $(FC) -show | grep openmpi)),openmpi)
     MPI_FAMILY = openmpi
@@ -144,7 +149,13 @@ else ifeq ($(CMP),NVIDIA)
       FFLAGS += -Mbounds -Mchkptr
       FFLAGS += -Ktrap=fp # Trap floating-point errors
     else
-      FFLAGS += -O3 -fast -tp=native
+      FFLAGS += -O3 -fast
+      ifeq ($(strip $(NVHPC_CPU_TARGET)),)
+        FFLAGS += -tp=native
+      endif
+    endif
+    ifneq ($(strip $(NVHPC_CPU_TARGET)),)
+      FFLAGS += -tp=$(NVHPC_CPU_TARGET)
     endif
   endif
   #FFLAGS += -cpp -O3 -Minfo=accel -stdpar -acc -target=multicore

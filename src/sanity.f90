@@ -18,7 +18,8 @@ module mod_sanity
   use mod_initflow  , only: add_noise
   use mod_initmpi   , only: initmpi
   use mod_initsolver, only: initsolver
-  use mod_param     , only: ipencil_axis,is_impdiff,is_impdiff_1d,is_poisson_pcr_tdma,small
+  use mod_param     , only: ipencil_axis,nh_g,is_impdiff,is_impdiff_1d,is_poisson_dtdma,small, &
+                            is_bulk_forcing_wall_shear,is_boussinesq_buoyancy,gacc
 #if !defined(_OPENACC)
   use mod_solver    , only: solver
 #else
@@ -42,23 +43,35 @@ module mod_sanity
     real(rp)        , intent(in), dimension(0:1,3,3) :: bcvel
     real(rp)        , intent(in), dimension(0:1,3)   :: bcpre
     logical         , intent(in), dimension(3)       :: is_forced
-    logical :: passed
+    logical :: passed,passed_loc
     !
-    call chk_dims(ng,dims,passed);                 if(.not.passed) call abortit
-    call chk_stop_type(stop_type,passed);          if(.not.passed) call abortit
-    call chk_bc(cbcvel,cbcpre,bcvel,bcpre,passed); if(.not.passed) call abortit
-    call chk_forcing(cbcpre,is_forced,passed);     if(.not.passed) call abortit
-    if(is_impdiff_1d .and. .not.is_impdiff) then
+    call chk_dims(ng,dims,cbcvel,cbcpre,passed);      if(.not.passed) call abortit
+    call chk_stop_type(stop_type,passed);             if(.not.passed) call abortit
+    call chk_bc(cbcvel,cbcpre,bcvel,bcpre,passed);    if(.not.passed) call abortit
+    call chk_forcing(cbcvel,cbcpre,is_forced,passed); if(.not.passed) call abortit
+    !
+    if(is_poisson_dtdma) then
+      passed_loc = ng(3)/dims(2) >= 2
+      if(is_impdiff.and.(.not.is_impdiff_1d .or. dims(2) > 1)) then
+        if(cbcvel(1,3,3) /= 'P') passed_loc = passed_loc.and.(ng(3)/dims(2)-1 >= 2)
+      end if
+      if(myid == 0.and.(.not.passed_loc)) &
+        print*, 'ERROR: DTDMA requires at least two active points per Z slab.'
+      passed = passed.and.passed_loc
+      if(.not.passed) call abortit
+    end if
+    !
+    if(is_impdiff_1d.and.(.not.is_impdiff)) then
       if(myid == 0)  print*, 'ERROR: `is_impdiff_1d = T` requires `is_impdiff = T` (forced in `param.f90`).'; call abortit
     end if
-    if(is_impdiff_1d .and. .not.(ipencil_axis == 3) .and. .not.is_poisson_pcr_tdma) then
+    if(is_impdiff_1d .and. .not.(ipencil_axis == 3) .and. .not.is_poisson_dtdma) then
       if(dims(2) > 1) then
         if(myid == 0)  print*, 'Warning: a run with implicit Z diffusion (`is_impdiff_1d = T`) is much more efficient &
                                        & when the flow is not decomposed along the Z direction.'
       end if
     end if
-    if(is_poisson_pcr_tdma .and. (ipencil_axis == 3)) then
-      if(myid == 0)  print*, 'ERROR: `is_poisson_pcr_tdma = T` requires X/Y-aligned pencils.'; call abortit
+    if(is_poisson_dtdma.and.(ipencil_axis == 3)) then
+      if(myid == 0)  print*, 'ERROR: `is_poisson_dtdma = T` requires X/Y-aligned pencils.'; call abortit
     end if
   end subroutine test_sanity_input
   !
@@ -73,22 +86,79 @@ module mod_sanity
     end if
   end subroutine chk_stop_type
   !
-  subroutine chk_dims(ng,dims,passed)
+  subroutine chk_dims(ng,dims,cbcvel,cbcpre,passed)
+    use mod_param, only: nscal,cbcscal
     implicit none
     integer, intent(in), dimension(3) :: ng
     integer, intent(in), dimension(2) :: dims
+    character(len=1), intent(in), dimension(0:1,3,3) :: cbcvel
+    character(len=1), intent(in), dimension(0:1,3)   :: cbcpre
     logical, intent(out) :: passed
     integer, dimension(2) :: ii
+    integer, dimension(3) :: ntasks
     logical :: passed_loc
+    integer :: idir,iscal
+    character(len=2) :: bc01v
     passed = .true.
+    passed_loc = all(ng(:) >= 1)
+    if(myid == 0.and.(.not.passed_loc)) &
+      print*, 'ERROR: ng(:) must be positive in every direction.'
+    passed = passed.and.passed_loc
+    !
     ii = pack([1,2,3],[1,2,3] /= ipencil_axis)
     passed_loc = all(dims(:)<=ng(ii)).and.all(dims(:)>=1)
     if(myid == 0.and.(.not.passed_loc)) &
       print*, 'ERROR: 1 <= dims(:) <= [ng(1),ng(2)], or [ng(1),ng(3)], or [ng(2),ng(3)] depending on the decomposition.'
     passed = passed.and.passed_loc
+    !
+    ! the halo layers are filled from a single neighbour, or mirrored about a boundary;
+    ! only a periodic direction held by a single task may have fewer cells than halo layers,
+    ! as its halo is then wrapped locally, one layer at a time (see `updthalo`)
+    !
+    ntasks(:) = 1
+    ntasks(ii(:)) = max(dims(:),1)
+    passed_loc = all(ng(:)/ntasks(:) >= nh_g.or.(cbcpre(0,:)//cbcpre(1,:) == 'PP'.and.ntasks(:) == 1))
+    if(myid == 0.and.(.not.passed_loc)) &
+      print*, 'ERROR: fewer cells per task than halo layers (nh_g) along a split or non-periodic direction.'
+    passed = passed.and.passed_loc
+    !
+    if(is_impdiff) then
+      passed_loc = .true.
+      do idir=1,2
+        if(ng(idir) /= 1) cycle
+        bc01v = cbcvel(0,idir,idir)//cbcvel(1,idir,idir)
+        passed_loc = passed_loc.and.bc01v /= 'NN'
+#if !defined(_OPENACC)
+        if(.not.is_impdiff_1d) passed_loc = passed_loc.and.(bc01v == 'PP'.or.bc01v == 'ND')
+#endif
+      end do
+      if(myid == 0.and.(.not.passed_loc)) &
+        print*, 'ERROR: unsupported one-point X/Y direction for the selected implicit velocity BCs.'
+      passed = passed.and.passed_loc
+    end if
+    !
+    if(ng(3) == 1) then
+      if(cbcpre(0,3)//cbcpre(1,3) == 'PP') then
+        passed_loc = all(cbcvel(:,3,:) == 'P')
+        do iscal=1,nscal
+          passed_loc = passed_loc.and.all(cbcscal(:,3,iscal) == 'P')
+        end do
+      else
+#if defined(_OPENACC)
+        passed_loc = .false.
+#else
+        passed_loc = .not.is_impdiff
+        if(cbcpre(0,3)//cbcpre(1,3) == 'NN') passed_loc = passed_loc.and.any(cbcpre(:,1:2) == 'D')
+#endif
+      end if
+      if(myid == 0.and.(.not.passed_loc)) &
+        print*, 'ERROR: unsupported one-point Z configuration; use periodic BCs for all fields.'
+      passed = passed.and.passed_loc
+    end if
   end subroutine chk_dims
   !
   subroutine chk_bc(cbcvel,cbcpre,bcvel,bcpre,passed)
+    use mod_param, only: nscal,cbcscal
     implicit none
     character(len=1), intent(in), dimension(0:1,3,3) :: cbcvel
     character(len=1), intent(in), dimension(0:1,3  ) :: cbcpre
@@ -96,7 +166,10 @@ module mod_sanity
     real(rp)        , intent(in), dimension(0:1,3  ) :: bcpre
     logical         , intent(out) :: passed
     character(len=2) :: bc01v,bc01p
-    integer :: ivel,idir
+    integer :: ivel,idir,iscal
+#if defined(_OPENACC)
+    character(len=2) :: bc01s
+#endif
     logical :: passed_loc
     passed = .true.
     !
@@ -128,6 +201,21 @@ module mod_sanity
     if(myid == 0.and.(.not.passed_loc)) print*, 'ERROR: pressure BCs not valid.'
     passed = passed.and.passed_loc
     !
+    ! check that all variables have the same periodic directions
+    !
+    passed_loc = .true.
+    do idir=1,3
+      do ivel=1,3
+        passed_loc = passed_loc.and.all((cbcvel(:,idir,ivel) == 'P').eqv.(cbcpre(:,idir) == 'P'))
+      end do
+      do iscal=1,nscal
+        passed_loc = passed_loc.and.all((cbcscal(:,idir,iscal) == 'P').eqv.(cbcpre(:,idir) == 'P'))
+      end do
+    end do
+    if(myid == 0.and.(.not.passed_loc)) &
+      print*, 'ERROR: velocity and scalar periodic BCs must match pressure BCs in every direction.'
+    passed = passed.and.passed_loc
+    !
     passed_loc = .true.
     do idir=1,3
       ivel = idir
@@ -149,18 +237,7 @@ module mod_sanity
     if(myid == 0.and.(.not.passed_loc)) &
       print*, 'ERROR: pressure BCs in directions x and y must be homogeneous (value = 0.).'
     passed = passed.and.passed_loc
-    if(is_impdiff) then
-      passed_loc = .true.
-      do ivel = 1,3
-        do idir=1,2
-          bc01v = cbcvel(0,idir,ivel)//cbcvel(1,idir,ivel)
-          passed_loc = passed_loc.and.(bc01v /= 'NN')
-        end do
-      end do
-      if(myid == 0.and.(.not.passed_loc)) &
-        print*, 'ERROR: Neumann-Neumann velocity BCs with implicit diffusion currently not supported in x and y; only in z.'
-      passed = passed.and.passed_loc
-      !
+    if(is_impdiff .and. .not.is_impdiff_1d) then
       passed_loc = .true.
       do ivel = 1,3
         do idir=1,2
@@ -172,21 +249,32 @@ module mod_sanity
       passed = passed.and.passed_loc
     end if
 #if defined(_OPENACC)
-    do idir=1,2
-      bc01p = cbcpre(0,idir)//cbcpre(1,idir)
-      passed_loc = passed_loc.and..not.( (bc01p == 'DN').or. &
-                                         (bc01p == 'ND') )
-    end do
-    if(myid == 0.and.(.not.passed_loc)) &
-      print*, 'ERROR: pressure BCs "ND" or "DN" along x or y not implemented on GPUs yet.'
+    if(is_impdiff .and. .not.is_impdiff_1d) then
+      passed_loc = .true.
+      do iscal=1,nscal
+        do idir=1,2
+          bc01s = cbcscal(0,idir,iscal)//cbcscal(1,idir,iscal)
+          passed_loc = passed_loc.and.( (bc01s == 'PP').or. &
+                                        (bc01s == 'ND').or. &
+                                        (bc01s == 'DN').or. &
+                                        (bc01s == 'NN').or. &
+                                        (bc01s == 'DD') )
+        end do
+      end do
+      if(myid == 0.and.(.not.passed_loc)) &
+        print*, 'ERROR: scalar BCs along x or y not valid.'
+      passed = passed.and.passed_loc
+    end if
 #endif
   end subroutine chk_bc
   !
-  subroutine chk_forcing(cbcpre,is_forced,passed)
+  subroutine chk_forcing(cbcvel,cbcpre,is_forced,passed)
     implicit none
+    character(len=1), intent(in), dimension(0:1,3,3) :: cbcvel
     character(len=1), intent(in), dimension(0:1,3) :: cbcpre
     logical         , intent(in), dimension(3) :: is_forced
     logical         , intent(out) :: passed
+    logical :: passed_loc
     integer :: idir
     passed = .true.
     !
@@ -199,9 +287,25 @@ module mod_sanity
     end do
     if(myid == 0.and.(.not.passed)) &
     print*, 'ERROR: Flow cannot be forced in a non-periodic direction; check the BCs and is_forced in `input.nml`.'
+    !
+    ! 2) check the requirements of the bulk forcing that balances the wall shear
+    !
+    if(is_bulk_forcing_wall_shear) then
+      passed_loc = .true.
+      do idir=1,3
+        if(is_forced(idir)) passed_loc = passed_loc.and..not.any(cbcvel(:,:,idir) == 'N')
+      end do
+      passed_loc = passed_loc.and..not.(is_impdiff.and..not.is_impdiff_1d.and.any(cbcpre(:,1:2) /= 'P'))
+      passed_loc = passed_loc.and..not.(is_boussinesq_buoyancy.and.any(is_forced(:).and.abs(gacc(:)) > 0.))
+      if(myid == 0.and.(.not.passed_loc)) &
+      print*, 'ERROR: `is_bulk_forcing_wall_shear = T` requires no-slip walls for the forced velocity components, &
+              &no fully implicit diffusion with walls along x or y, and no gravity along a forced direction with &
+              &Boussinesq buoyancy.'
+      passed = passed.and.passed_loc
+    end if
   end subroutine chk_forcing
   !
-  subroutine test_sanity_solver(ng,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,l,dli,dzc,dzf,dzci,dzfi,dzci_g,dzfi_g, &
+  subroutine test_sanity_solver(ng,lo,hi,n,nh_v,nh_p,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,n_z,l,dl,dli,dzc,dzf,dzci,dzfi,dzci_g,dzfi_g, &
                                 nb,is_bound,cbcvel,cbcpre,bcvel,bcpre)
 #if defined(_OPENACC)
     use mod_workspaces     , only: set_cufft_wspace
@@ -209,9 +313,10 @@ module mod_sanity
 #endif
     implicit none
     integer , intent(in), dimension(3) :: ng,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z
+    integer , intent(in)               :: nh_v,nh_p,nh_g
     real(rp), intent(in), dimension(3) :: l
-    real(rp), intent(in), dimension(3) :: dli
-    real(rp), intent(in), dimension(0:) :: dzc,dzf,dzci,dzfi,dzci_g,dzfi_g
+    real(rp), intent(in), dimension(3) :: dl,dli
+    real(rp), intent(in), dimension(1-nh_g:) :: dzc,dzf,dzci,dzfi,dzci_g,dzfi_g
     integer , intent(in), dimension(0:1,3) :: nb
     logical , intent(in), dimension(0:1,3) :: is_bound
     character(len=1), intent(in), dimension(0:1,3,3) :: cbcvel
@@ -228,17 +333,16 @@ module mod_sanity
     real(rp), allocatable, dimension(:,:) ::  lambdaxy
     real(rp), allocatable, dimension(:) :: a,b,c,bb
     real(rp), allocatable, dimension(:,:,:) :: rhsbx,rhsby,rhsbz
-    real(rp), dimension(3) :: dl
     real(rp) :: dt,dti,alpha
     real(rp) :: divtot,divmax,restot,resmax
     integer :: i,j,k
     logical :: passed,passed_loc
     passed = .true.
     !$acc wait
-    allocate(u(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-             v(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-             w(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-             p(0:n(1)+1,0:n(2)+1,0:n(3)+1), &
+    allocate(u(1-nh_v:n(1)+nh_v,1-nh_v:n(2)+nh_v,1-nh_v:n(3)+nh_v), &
+             v(1-nh_v:n(1)+nh_v,1-nh_v:n(2)+nh_v,1-nh_v:n(3)+nh_v), &
+             w(1-nh_v:n(1)+nh_v,1-nh_v:n(2)+nh_v,1-nh_v:n(3)+nh_v), &
+             p(1-nh_p:n(1)+nh_p,1-nh_p:n(2)+nh_p,1-nh_p:n(3)+nh_p), &
              lambdaxy(n_z(1),n_z(2)), &
              a(n_z(3)),b(n_z(3)),c(n_z(3)), &
              rhsbx(n(2),n(3),0:1), &
@@ -259,23 +363,22 @@ module mod_sanity
     !
     ! test pressure correction
     !
-    call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcpre,bcpre(:,:), &
+    call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcpre,bcpre(:,:), &
                     lambdaxy,['c','c','c'],a,b,c,arrplan,normfft,rhsbx,rhsby,rhsbz)
     !$acc enter data copyin(lambdaxy,a,b,c,rhsbx,rhsby,rhsbz)
 #if defined(_OPENACC)
     call set_cufft_wspace(pack(arrplan,.true.),istream_acc_queue_1)
 #endif
-    dl  = dli**(-1)
     dt  = acos(-1.) ! value is irrelevant
     dti = dt**(-1)
-    call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w)
-    call fillps(n,dli,dzfi,dti,u,v,w,p)
-    call updt_rhs_b(['c','c','c'],cbcpre,n,is_bound,rhsbx,rhsby,rhsbz,p)
-    call solver(n,ng,arrplan,normfft,lambdaxy,a,b,c,cbcpre,['c','c','c'],p)
-    call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,p)
-    call correc(n,dli,dzci,dt,p,u,v,w)
-    call bounduvw(cbcvel,n,bcvel,nb,is_bound,.true.,dl,dzc,dzf,u,v,w)
-    call chkdiv(lo,hi,l,dli,dzfi,u,v,w,divtot,divmax)
+    call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w,.false.,-1)
+    call fillps(n,nh_v,nh_p,nh_g,dli,dzfi,dti,u,v,w,p)
+    call updt_rhs_b(['c','c','c'],cbcpre,n,nh_p,is_bound,rhsbx,rhsby,rhsbz,p)
+    call solver(n,nh_p,ng,arrplan,normfft,lambdaxy,a,b,c,cbcpre,['c','c','c'],p)
+    call boundp(cbcpre,n,nh_p,nh_g,bcpre,nb,is_bound,dl,dzc,p)
+    call correc(n,nh_v,nh_p,nh_g,dli,dzci,dt,p,u,v,w)
+    call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w,.true.,1,0)
+    call chkdiv(lo,hi,nh_v,nh_g,l,dli,dzfi,u,v,w,divtot,divmax)
     passed_loc = divmax < small
     if(myid == 0.and.(.not.passed_loc)) &
     print*, 'ERROR: Pressure correction: Divergence is too large, with maximum = ', divmax
@@ -283,7 +386,7 @@ module mod_sanity
     call fftend(arrplan)
     if(is_impdiff .and. .not.is_impdiff_1d) then
       allocate(bb(n_z(3)))
-      alpha = acos(-1.) ! irrelevant
+      alpha = -acos(-1.) ! negative shift, as in implicit diffusion
       !$acc parallel loop collapse(3) default(present)
       !$OMP parallel do   collapse(3) DEFAULT(shared)
       do k=0,n(3)+1
@@ -301,13 +404,13 @@ module mod_sanity
       call add_noise(ng,lo,789,.5_rp,w(1:n(1),1:n(2),1:n(3)))
       !$acc update device(u,v,w)
       !$acc enter data create(bb)
-      call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,1),bcvel(:,:,1), &
+      call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,1),bcvel(:,:,1), &
                       lambdaxy,['f','c','c'],a,b,c,arrplan,normfft,rhsbx,rhsby,rhsbz)
       !$acc update device(lambdaxy,a,b,c,rhsbx,rhsby,rhsbz)
 #if defined(_OPENACC)
       call set_cufft_wspace(pack(arrplan,.true.),istream_acc_queue_1)
 #endif
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w)
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w)
       !$acc parallel loop collapse(3) default(present)
       !$OMP parallel do   collapse(3) DEFAULT(shared)
       do k=0,n(3)+1
@@ -323,23 +426,24 @@ module mod_sanity
       do k=1,n_z(3)
         bb(k) = b(k) + alpha
       end do
-      call updt_rhs_b(['f','c','c'],cbcvel(:,:,1),n,is_bound,rhsbx,rhsby,rhsbz,u)
-      call solver(n,ng,arrplan,normfft,lambdaxy,a,bb,c,cbcvel(:,:,1),['f','c','c'],u)
+      call updt_rhs_b(['f','c','c'],cbcvel(:,:,1),n,nh_v,is_bound,rhsbx,rhsby,rhsbz,u)
+      call solver(n,nh_v,ng,arrplan,normfft,lambdaxy,a,bb,c,cbcvel(:,:,1),['f','c','c'],u)
       call fftend(arrplan)
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w) ! actually, we are only interested in the boundary condition in `u`
-      call chk_helmholtz(lo,hi,l,dli,dzci,dzfi,alpha,p,u,cbcvel(:,:,1),is_bound,['f','c','c'],restot,resmax)
+      ! actually, we are only interested in the boundary condition in `u`
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w)
+      call chk_helmholtz(lo,hi,nh_p,nh_v,nh_g,l,dli,dzci,dzfi,alpha,p,u,cbcvel(:,:,1),is_bound,['f','c','c'],restot,resmax)
       passed_loc = resmax < small
       if(myid == 0.and.(.not.passed_loc)) &
       print*, 'ERROR: wrong solution of Helmholtz equation in x direction.'
       passed = passed.and.passed_loc
       !
-      call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,2),bcvel(:,:,2), &
+      call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,2),bcvel(:,:,2), &
                       lambdaxy,['c','f','c'],a,b,c,arrplan,normfft,rhsbx,rhsby,rhsbz)
       !$acc update device(lambdaxy,a,b,c,rhsbx,rhsby,rhsbz)
 #if defined(_OPENACC)
       call set_cufft_wspace(pack(arrplan,.true.),istream_acc_queue_1)
 #endif
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w)
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w)
       !$acc parallel loop collapse(3) default(present)
       !$OMP parallel do   collapse(3) DEFAULT(shared)
       do k=0,n(3)+1
@@ -355,23 +459,24 @@ module mod_sanity
       do k=1,n_z(3)
         bb(k) = b(k) + alpha
       end do
-      call updt_rhs_b(['c','f','c'],cbcvel(:,:,2),n,is_bound,rhsbx,rhsby,rhsbz,v)
-      call solver(n,ng,arrplan,normfft,lambdaxy,a,bb,c,cbcvel(:,:,2),['c','f','c'],v)
+      call updt_rhs_b(['c','f','c'],cbcvel(:,:,2),n,nh_v,is_bound,rhsbx,rhsby,rhsbz,v)
+      call solver(n,nh_v,ng,arrplan,normfft,lambdaxy,a,bb,c,cbcvel(:,:,2),['c','f','c'],v)
       call fftend(arrplan)
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w) ! actually, we are only interested in the boundary condition in `v`
-      call chk_helmholtz(lo,hi,l,dli,dzci,dzfi,alpha,p,v,cbcvel(:,:,2),is_bound,['c','f','c'],restot,resmax)
+      ! actually, we are only interested in the boundary condition in `v`
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w)
+      call chk_helmholtz(lo,hi,nh_p,nh_v,nh_g,l,dli,dzci,dzfi,alpha,p,v,cbcvel(:,:,2),is_bound,['c','f','c'],restot,resmax)
       passed_loc = resmax < small
       if(myid == 0.and.(.not.passed_loc)) &
       print*, 'ERROR: wrong solution of Helmholtz equation in y direction.'
       passed = passed.and.passed_loc
       !
-      call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,3),bcvel(:,:,3), &
+      call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,3),bcvel(:,:,3), &
                       lambdaxy,['c','c','f'],a,b,c,arrplan,normfft,rhsbx,rhsby,rhsbz)
       !$acc update device(lambdaxy,a,b,c,rhsbx,rhsby,rhsbz)
 #if defined(_OPENACC)
       call set_cufft_wspace(pack(arrplan,.true.),istream_acc_queue_1)
 #endif
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w)
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w)
       !$acc parallel loop collapse(3) default(present)
       !$OMP parallel do   collapse(3) DEFAULT(shared)
       do k=0,n(3)+1
@@ -387,11 +492,12 @@ module mod_sanity
       do k=1,n_z(3)
         bb(k) = b(k) + alpha
       end do
-      call updt_rhs_b(['c','c','f'],cbcvel(:,:,3),n,is_bound,rhsbx,rhsby,rhsbz,w)
-      call solver(n,ng,arrplan,normfft,lambdaxy,a,bb,c,cbcvel(:,:,3),['c','c','f'],w)
+      call updt_rhs_b(['c','c','f'],cbcvel(:,:,3),n,nh_v,is_bound,rhsbx,rhsby,rhsbz,w)
+      call solver(n,nh_v,ng,arrplan,normfft,lambdaxy,a,bb,c,cbcvel(:,:,3),['c','c','f'],w)
       call fftend(arrplan)
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w) ! actually, we are only interested in the boundary condition in `w`
-      call chk_helmholtz(lo,hi,l,dli,dzci,dzfi,alpha,p,w,cbcvel(:,:,3),is_bound,['c','c','f'],restot,resmax)
+      ! actually, we are only interested in the boundary condition in `w`
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w)
+      call chk_helmholtz(lo,hi,nh_p,nh_v,nh_g,l,dli,dzci,dzfi,alpha,p,w,cbcvel(:,:,3),is_bound,['c','c','f'],restot,resmax)
       passed_loc = resmax < small
       if(myid == 0.and.(.not.passed_loc)) &
       print*, 'ERROR: wrong solution of Helmholtz equation in z direction.'

@@ -33,7 +33,7 @@ program cans
   use mod_bound          , only: boundp,bounduvw,updt_rhs_b
   use mod_chkdiv         , only: chkdiv
   use mod_chkdt          , only: chkdt
-  use mod_common_mpi     , only: myid,ierr,dinfo_ptdma
+  use mod_common_mpi     , only: myid,ierr,dinfo_dtdma
   use mod_correc         , only: correc
   use mod_fft            , only: fftini,fftend
   use mod_fillps         , only: fillps
@@ -42,9 +42,10 @@ program cans
   use mod_initmpi        , only: initmpi
   use mod_initsolver     , only: initsolver
   use mod_load           , only: load_one
-  use mod_mom            , only: bulk_forcing
-  use mod_rk             , only: rk,rk_scal
-  use mod_output         , only: out0d,gen_alias,out1d,out1d_chan,out2d,out3d,write_log_output,write_visu_2d,write_visu_3d
+  use mod_mom            , only: cmpt_wallshear
+  use mod_rk             , only: rk,rk_scal,bulk_forcing_wall_shear
+  use mod_output         , only: is_output_due, &
+                                 out0d,gen_alias,out1d,out1d_chan,out2d,out3d,write_log_output,write_visu_2d,write_visu_3d
   use mod_param          , only: ng,l,dl,dli, &
                                  gtype,gr, &
                                  cfl,dtmax,dt_f, &
@@ -53,8 +54,10 @@ program cans
                                  nstep,time_max,tw_max,stop_type, &
                                  restart,is_overwrite_save,nsaves_max, &
                                  icheck,iout0d,iout1d,iout2d,iout3d,isave, &
+                                 tout0d,tout1d,tout2d,tout3d,tsave, &
                                  cbcvel,bcvel,cbcpre,bcpre, &
                                  is_forced,bforce,velf, &
+                                 is_bulk_forcing_wall_shear, &
                                  gacc,nscal,beta, &
                                  dims, &
                                  nb,is_bound, &
@@ -64,8 +67,9 @@ program cans
                                  is_debug,is_debug_poisson, &
                                  is_timing, &
                                  is_impdiff,is_impdiff_1d, &
-                                 is_poisson_pcr_tdma, &
-                                 is_mask_divergence_check
+                                 is_poisson_dtdma, &
+                                 is_mask_divergence_check, &
+                                 nh_v,nh_p,nh_s,nh_g
   use mod_sanity         , only: test_sanity_input,test_sanity_solver
   use mod_scal           , only: scalar,initialize_scalars,bulk_forcing_s
   use mod_solve_helmholtz, only: solve_helmholtz,rhs_bound
@@ -74,9 +78,10 @@ program cans
 #else
   use mod_solver_gpu     , only: solver => solver_gpu
   use mod_workspaces     , only: init_wspace_arrays,set_cufft_wspace,cudecomp_finalize
-  use mod_common_cudecomp, only: istream_acc_queue_1,ap_z_ptdma
+  use mod_common_cudecomp, only: istream_acc_queue_1,ap_z_dtdma
 #endif
   use mod_updatep        , only: updatep
+  use mod_posix          , only: rename_file,read_link
   use mod_utils          , only: bulk_mean
 #if defined(_OPENACC)
   use mod_utils          , only: device_memory_footprint
@@ -87,7 +92,7 @@ program cans
   integer , dimension(3) :: lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z
   real(rp), target, allocatable, dimension(:,:,:) :: u,v,w,p,pp
   real(rp), allocatable, dimension(:,:,:) :: dudtrko,dvdtrko,dwdtrko
-  real(rp), dimension(0:1,3) :: tauxo,tauyo,tauzo
+  real(rp), dimension(0:1,3,3) :: tau,tauo
   real(rp), dimension(3) :: f
 #if !defined(_OPENACC) || defined(_USE_HIP)
   type(C_PTR), dimension(2,2) :: arrplanp
@@ -98,7 +103,7 @@ program cans
   real(rp), allocatable, dimension(:) :: ap,bp,cp
   integer , dimension(3) :: n_z_d
   real(rp), allocatable, dimension(:,:,:) :: ap_d,cp_d
-  logical :: is_ptdma_update_p
+  logical :: is_dtdma_update_p
   real(rp) :: normfftp
   type(rhs_bound) :: rhsbp
   real(rp) :: alpha
@@ -112,7 +117,7 @@ program cans
   real(rp) :: normfftu,normfftv,normfftw
   type(rhs_bound) :: rhsbu,rhsbv,rhsbw
   !
-  real(rp) :: dt,dti,dt_cfl,time,dtrk,dtrki,divtot,divmax
+  real(rp) :: dt,dti,dt_cfl,time,time_start,dtrk,dtrki,divtot,divmax
   integer :: irk,istep,iunit
   real(rp), allocatable, dimension(:) :: dzc  ,dzf  ,zc  ,zf  ,dzci  ,dzfi, &
                                          dzc_g,dzf_g,zc_g,zf_g,dzci_g,dzfi_g, &
@@ -120,6 +125,7 @@ program cans
                                          grid_vol_ratio_c,grid_vol_ratio_f
   real(rp) :: meanvelu,meanvelv,meanvelw
   real(rp), dimension(3) :: dpdl
+  logical , dimension(3) :: is_forced_rk
   !
   type(scalar), target, allocatable, dimension(:) :: scalars
   type(scalar), pointer :: s
@@ -131,17 +137,21 @@ program cans
   real(rp), dimension(42) :: var
   !
   real(rp) :: dt12,dt12av,dt12min,dt12max
-  real(rp) :: twi,tw
+  real(dp) :: twi,tw
   !
   integer  :: savecounter
   character(len=7  ) :: fldnum
   character(len=3  ) :: scalnum
   character(len=4  ) :: chkptnum
   character(len=100) :: filename
+  character(len=256) :: fname_save
+  logical :: is_save_tmp
+  integer :: istat
   type :: arr_ptr
     real(rp), pointer, contiguous , dimension(:,:,:) :: arr
   end type arr_ptr
   type(arr_ptr)    , allocatable, dimension(:) ::   io_vars
+  integer          , allocatable, dimension(:,:) ::    nh_io
   character(len=10), allocatable, dimension(:) :: c_io_vars
   integer :: k,kk
   logical :: is_done,kill
@@ -156,45 +166,45 @@ program cans
   ! initialize MPI/OpenMP
   !
   !$ call omp_set_num_threads(omp_get_max_threads())
-  call initmpi(ng,dims,cbcpre,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,nb,is_bound)
+  call initmpi(ng,dims,cbcpre,nh_g,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,nb,is_bound)
   twi = MPI_WTIME()
   savecounter = 0
   !
   ! allocate variables
   !
-  allocate(u( 0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-           v( 0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-           w( 0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-           p( 0:n(1)+1,0:n(2)+1,0:n(3)+1), &
-           pp(0:n(1)+1,0:n(2)+1,0:n(3)+1))
+  allocate(u( 1-nh_v:n(1)+nh_v,1-nh_v:n(2)+nh_v,1-nh_v:n(3)+nh_v), &
+           v( 1-nh_v:n(1)+nh_v,1-nh_v:n(2)+nh_v,1-nh_v:n(3)+nh_v), &
+           w( 1-nh_v:n(1)+nh_v,1-nh_v:n(2)+nh_v,1-nh_v:n(3)+nh_v), &
+           p( 1-nh_p:n(1)+nh_p,1-nh_p:n(2)+nh_p,1-nh_p:n(3)+nh_p), &
+           pp(1-nh_p:n(1)+nh_p,1-nh_p:n(2)+nh_p,1-nh_p:n(3)+nh_p))
   allocate(dudtrko(n(1),n(2),n(3)), &
            dvdtrko(n(1),n(2),n(3)), &
            dwdtrko(n(1),n(2),n(3)))
   allocate(lambdaxyp(n_z(1),n_z(2)))
   allocate(ap(n_z(3)),bp(n_z(3)),cp(n_z(3)))
-  if(is_poisson_pcr_tdma) then
+  if(is_poisson_dtdma) then
 #if defined(_OPENACC)
-    n_z_d(:) = ap_z_ptdma%shape(:)
+    n_z_d(:) = ap_z_dtdma%shape(:)
 #else
-    n_z_d(:) = dinfo_ptdma%zsz(:)
+    n_z_d(:) = dinfo_dtdma%zsz(:)
 #endif
     allocate(ap_d(n_z_d(1),n_z_d(2),n_z_d(3)), &
              cp_d(n_z_d(1),n_z_d(2),n_z_d(3)))
   end if
-  allocate(dzc( 0:n(3)+1), &
-           dzf( 0:n(3)+1), &
-           zc(  0:n(3)+1), &
-           zf(  0:n(3)+1), &
-           dzci(0:n(3)+1), &
-           dzfi(0:n(3)+1))
-  allocate(dzc_g( 0:ng(3)+1), &
-           dzf_g( 0:ng(3)+1), &
-           zc_g(  0:ng(3)+1), &
-           zf_g(  0:ng(3)+1), &
-           dzci_g(0:ng(3)+1), &
-           dzfi_g(0:ng(3)+1))
-  allocate(xc_g(0:ng(1)+1),xf_g(0:ng(1)+1), &
-           yc_g(0:ng(2)+1),yf_g(0:ng(2)+1))
+  allocate(dzc( 1-nh_g:n(3)+nh_g), &
+           dzf( 1-nh_g:n(3)+nh_g), &
+           zc(  1-nh_g:n(3)+nh_g), &
+           zf(  1-nh_g:n(3)+nh_g), &
+           dzci(1-nh_g:n(3)+nh_g), &
+           dzfi(1-nh_g:n(3)+nh_g))
+  allocate(dzc_g( 1-nh_g:ng(3)+nh_g), &
+           dzf_g( 1-nh_g:ng(3)+nh_g), &
+           zc_g(  1-nh_g:ng(3)+nh_g), &
+           zf_g(  1-nh_g:ng(3)+nh_g), &
+           dzci_g(1-nh_g:ng(3)+nh_g), &
+           dzfi_g(1-nh_g:ng(3)+nh_g))
+  allocate(xc_g(1-nh_g:ng(1)+nh_g),xf_g(1-nh_g:ng(1)+nh_g), &
+           yc_g(1-nh_g:ng(2)+nh_g),yf_g(1-nh_g:ng(2)+nh_g))
   allocate(grid_vol_ratio_c,mold=dzc)
   allocate(grid_vol_ratio_f,mold=dzf)
   allocate(rhsbp%x(n(2),n(3),0:1), &
@@ -219,7 +229,7 @@ program cans
   end if
   !
   allocate(scalars(nscal))
-  call initialize_scalars(scalars,nscal,n,n_z)
+  call initialize_scalars(scalars,nscal,n,nh_s,n_z)
   allocate(fs(nscal))
   !$acc enter data copyin(scalars(:))
   !
@@ -239,21 +249,21 @@ program cans
   if(myid == 0) print*, '*** Beginning of simulation ***'
   if(myid == 0) print*, '*******************************'
   if(myid == 0) print*, ''
-  call initgrid(gtype,ng(3),gr,l(3),dzc_g,dzf_g,zc_g,zf_g,cbcpre(0,3)//cbcpre(1,3) == 'PP')
-  do kk=0,ng(1)+1
+  call initgrid(gtype,ng(3),nh_g,gr,l(3),dzc_g,dzf_g,zc_g,zf_g,cbcpre(0,3)//cbcpre(1,3) == 'PP')
+  do kk=1-nh_g,ng(1)+nh_g
     xc_g(kk) = (kk-0.5_rp)*dl(1)
-    xf_g(kk) = (kk-1.0_rp)*dl(1)
+    xf_g(kk) = kk*dl(1)
   end do
-  do kk=0,ng(2)+1
+  do kk=1-nh_g,ng(2)+nh_g
     yc_g(kk) = (kk-0.5_rp)*dl(2)
-    yf_g(kk) = (kk-1.0_rp)*dl(2)
+    yf_g(kk) = kk*dl(2)
   end do
   if(myid == 0) then
     open(newunit=iunit,file=trim(datadir)//'geometry.out',status='replace')
-    write(iunit,*) ng(1),ng(2),ng(3)
-    write(iunit,*) l(1),l(2),l(3)
+    write(iunit,'(*(1x,i0))') ng(1),ng(2),ng(3)
+    write(iunit,'(*(1x,es24.16e3))') l(1),l(2),l(3)
     close(iunit)
-    call save_grid(datadir,'grid',ng,zc_g,zf_g,dzc_g,dzf_g)
+    call save_grid(datadir,'grid',ng,nh_g,zc_g,zf_g,dzc_g,dzf_g)
   end if
   !$acc enter data copyin(lo,hi,n) async
   !$acc enter data copyin(bforce,dl,dli,l) async
@@ -262,7 +272,7 @@ program cans
   !$acc enter data create(zc,zf,dzc,dzf,dzci,dzfi,dzci_g,dzfi_g) async
   !
   !$acc parallel loop default(present) private(k) async
-  do kk=lo(3)-1,hi(3)+1
+  do kk=lo(3)-nh_g,hi(3)+nh_g
     k = kk-(lo(3)-1)
     zc( k) = zc_g(kk)
     zf( k) = zf_g(kk)
@@ -273,14 +283,14 @@ program cans
   end do
   !$acc data copy(ng) async
   !$acc parallel loop default(present) async
-  do k=0,ng(3)+1
+  do k=1-nh_g,ng(3)+nh_g
     dzci_g(k) = dzc_g(k)**(-1)
     dzfi_g(k) = dzf_g(k)**(-1)
   end do
   !$acc end data
   !$acc enter data create(grid_vol_ratio_c,grid_vol_ratio_f) async
   !$acc parallel loop default(present) async
-  do k=0,n(3)+1
+  do k=1-nh_g,n(3)+nh_g
     grid_vol_ratio_c(k) = dl(1)*dl(2)*dzc(k)/(l(1)*l(2)*l(3))
     grid_vol_ratio_f(k) = dl(1)*dl(2)*dzf(k)/(l(1)*l(2)*l(3))
   end do
@@ -294,24 +304,24 @@ program cans
   !
   ! initialize Poisson solver
   !
-  call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcpre,bcpre(:,:), &
+  call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcpre,bcpre(:,:), &
                   lambdaxyp,['c','c','c'],ap,bp,cp,arrplanp,normfftp,rhsbp%x,rhsbp%y,rhsbp%z)
   !$acc enter data copyin(lambdaxyp,ap,bp,cp) async
   !$acc enter data copyin(rhsbp,rhsbp%x,rhsbp%y,rhsbp%z) async
-  if(is_poisson_pcr_tdma) then
+  if(is_poisson_dtdma) then
     !$acc enter data create(ap_d,cp_d) async
   end if
   !$acc wait
   if(is_impdiff) then
-    call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,1),bcvel(:,:,1), &
+    call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,1),bcvel(:,:,1), &
                     lambdaxyu,['f','c','c'],au,bu,cu,arrplanu,normfftu,rhsbu%x,rhsbu%y,rhsbu%z)
-    call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,2),bcvel(:,:,2), &
+    call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,2),bcvel(:,:,2), &
                     lambdaxyv,['c','f','c'],av,bv,cv,arrplanv,normfftv,rhsbv%x,rhsbv%y,rhsbv%z)
-    call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,3),bcvel(:,:,3), &
+    call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbcvel(:,:,3),bcvel(:,:,3), &
                     lambdaxyw,['c','c','f'],aw,bw,cw,arrplanw,normfftw,rhsbw%x,rhsbw%y,rhsbw%z)
     do iscal=1,nscal
       s => scalars(iscal)
-      call initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,s%cbc,s%bc, &
+      call initsolver(ng,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,s%cbc,s%bc, &
                       s%lambdaxy,['c','c','c'],s%a,s%b,s%c,s%arrplan,s%normfft, &
                       s%rhsb%x,s%rhsb%y,s%rhsb%z)
     end do
@@ -349,16 +359,20 @@ program cans
     call set_cufft_wspace(pack(arrplanu,.true.),istream_acc_queue_1)
     call set_cufft_wspace(pack(arrplanv,.true.),istream_acc_queue_1)
     call set_cufft_wspace(pack(arrplanw,.true.),istream_acc_queue_1)
+    do iscal=1,nscal
+      call set_cufft_wspace(pack(scalars(iscal)%arrplan,.true.),istream_acc_queue_1)
+    end do
   end if
   if(myid == 0) print*,'*** Device memory footprint (Gb): ', &
-                  device_memory_footprint(n,n_z,nscal)/(1._sp*1024**3), ' ***'
+                  device_memory_footprint(n,nh_v,nh_p,nh_s,nh_g,n_z,nscal)/(1._sp*1024**3), ' ***'
 #endif
   if(is_debug_poisson) then
-    call test_sanity_solver(ng,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,l,dli,dzc,dzf,dzci,dzfi,dzci_g,dzfi_g, &
-                            nb,is_bound,cbcvel,cbcpre,bcvel,bcpre)
+    call test_sanity_solver(ng,lo,hi,n,nh_v,nh_p,nh_g,n_x_fft,n_y_fft,lo_z,hi_z,n_z,l,dl,dli, &
+                            dzc,dzf,dzci,dzfi,dzci_g,dzfi_g,nb,is_bound,cbcvel,cbcpre,bcvel,bcpre)
   end if
   !
-  allocate(io_vars(4+nscal),c_io_vars(4+nscal)) ! u,v,w,p,scalars
+  allocate(io_vars(4+nscal),c_io_vars(4+nscal),nh_io(3,4+nscal)) ! u,v,w,p,scalars
+  nh_io(:,1:3) = nh_v; nh_io(:,4) = nh_p; nh_io(:,5:) = nh_s
   io_vars(1)%arr => u; c_io_vars(1) = 'u'
   io_vars(2)%arr => v; c_io_vars(2) = 'v'
   io_vars(3)%arr => w; c_io_vars(3) = 'w'
@@ -368,31 +382,49 @@ program cans
     io_vars(4+iscal)%arr => scalars(iscal)%val; c_io_vars(4+iscal) = 's_'//scalnum
   end do
   !
-  is_ptdma_update_p = .true.
+  is_dtdma_update_p = .true.
   !
+  u(:,:,:)  = 0.
+  v(:,:,:)  = 0.
+  w(:,:,:)  = 0.
+  p(:,:,:)  = 0.
+  pp(:,:,:) = 0.
+  do iscal=1,nscal
+    scalars(iscal)%val(:,:,:) = 0.
+  end do
   if(.not.restart) then
     istep = 0
     time = 0.
-    call initflow(inivel,bcvel,ng,lo,l,dl,zc,zf,dzc,dzf,visc,is_forced,velf,bforce,is_wallturb,u,v,w,p)
+    call initflow(inivel,cbcvel,bcvel,ng,lo,nh_v,nh_p,nh_g,l,dl,zc,zf,dzc,dzf,visc, &
+                  is_forced,velf,bforce,is_wallturb,u,v,w,p)
     do iscal=1,nscal
       s => scalars(iscal)
-      call initscal(s%ini,s%bc,ng,lo,l,dl,zc,dzf,s%alpha,s%is_forced,s%scalf,s%val)
+      call initscal(s%ini,s%bc,ng,lo,nh_s,nh_g,l,dl,zc,dzf,s%alpha,s%is_forced,s%scalf,s%val)
     end do
     if(myid == 0) print*, '*** Initial condition successfully set ***'
   else
     do is=1,4+nscal
       call load_one('r',trim(datadir)//'fld_'//trim(c_io_vars(is))//trim(io_ext), &
-                    MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep)
+                    MPI_COMM_WORLD,ng,nh_io(:,is),nh_g,lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+                    is_check_time=is > 1)
     end do
     if(myid == 0) print*, '*** Checkpoint loaded at time = ', time, 'time step = ', istep, '. ***'
+    if(is_overwrite_save.and.nsaves_max > 0) then
+      if(myid == 0) then
+        istat = read_link(trim(datadir)//'fld_'//trim(c_io_vars(1))//trim(io_ext),fname_save)
+        if(istat == 0) read(fname_save(5:8),'(i4)',iostat=istat) savecounter
+        if(istat /= 0) savecounter = 0
+      end if
+      call MPI_BCAST(savecounter,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+    end if
   end if
-  !$acc enter data copyin(u,v,w,p,dudtrko,dvdtrko,dwdtrko) create(pp)
-  call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w)
-  call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,p)
+  !$acc enter data copyin(u,v,w,p,pp,dudtrko,dvdtrko,dwdtrko)
+  call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w,restart)
+  call boundp(cbcpre,n,nh_p,nh_g,bcpre,nb,is_bound,dl,dzc,p,1)
   do iscal=1,nscal
     s => scalars(iscal)
     !$acc enter data copyin(s%val,s%dsdtrko) async(1)
-    call boundp(s%cbc,n,s%bc,nb,is_bound,dl,dzc,s%val)
+    call boundp(s%cbc,n,nh_s,nh_g,s%bc,nb,is_bound,dl,dzc,s%val)
   end do
   !$acc wait
   !
@@ -404,21 +436,23 @@ program cans
   do iscal=1,nscal
     !$acc update self(scalars(iscal)%val)
   end do
-  if(iout1d > 0.and.mod(istep,max(iout1d,1)) == 0) then
+  if(is_output_due(istep,iout1d,tout1d,time,time,restart)) then
     include 'out1d.h90'
   end if
-  if(iout2d > 0.and.mod(istep,max(iout2d,1)) == 0) then
+  if(is_output_due(istep,iout2d,tout2d,time,time,restart)) then
     include 'out2d.h90'
   end if
-  if(iout3d > 0.and.mod(istep,max(iout3d,1)) == 0) then
+  if(is_output_due(istep,iout3d,tout3d,time,time,restart)) then
     include 'out3d.h90'
   end if
   !
-  call chkdt(n,dl,dzci,dzfi,visc,alpha_max,u,v,w,dt_cfl)
+  call chkdt(n,nh_v,nh_g,dl,dzci,dzfi,visc,alpha_max,u,v,w,dt_cfl)
   dt = merge(dt_f,min(cfl*dt_cfl,dtmax),dt_f > 0.)
   if(myid == 0) print*, 'dt_cfl = ', dt_cfl, 'dt = ', dt
   dti = 1./dt
   kill = .false.
+  is_forced_rk(:) = is_forced(:).and..not.is_bulk_forcing_wall_shear
+  tau(:,:,:) = 0.
   !
   ! main loop
   !
@@ -430,9 +464,9 @@ program cans
       dt12 = MPI_WTIME()
     end if
     istep = istep + 1
+    time_start = time
     time = time + dt
     if(myid == 0) print*, 'Time step #', istep, 'Time = ', time
-    tauxo(:,:) = 0.; tauyo(:,:) = 0.; tauzo(:,:) = 0.
     dpdl(:)     = 0.
     fs(1:nscal) = 0.
     do irk=1,3
@@ -440,38 +474,46 @@ program cans
       dtrki = dtrk**(-1)
       do iscal=1,nscal
         s => scalars(iscal)
-        call rk_scal(rkcoeff(:,irk),n,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
+        call rk_scal(rkcoeff(:,irk),n,nh_v,nh_s,nh_g,dli,l,dzci,dzfi,grid_vol_ratio_f,s%alpha,dt,is_bound,u,v,w, &
                      s%is_forced,s%scalf,s%source,s%fluxo,s%dsdtrko,s%val,s%f)
-        call bulk_forcing_s(n,s%is_forced,s%f,s%val)
+        call bulk_forcing_s(n,nh_s,s%is_forced,s%f,s%val)
         fs(iscal) = fs(iscal) + s%f
         if(is_impdiff) then
-          call solve_helmholtz(n,ng,hi,s%arrplan,s%normfft,-0.5*s%alpha*dtrk, &
+          call solve_helmholtz(n,nh_s,ng,hi,s%arrplan,s%normfft,-0.5*s%alpha*dtrk, &
                                s%lambdaxy,s%a,s%b,s%c,s%rhsb%x,s%rhsb%y,s%rhsb%z,is_bound,s%cbc,['c','c','c'],s%val)
         end if
-        call boundp(s%cbc,n,s%bc,nb,is_bound,dl,dzc,s%val)
+        call boundp(s%cbc,n,nh_s,nh_g,s%bc,nb,is_bound,dl,dzc,s%val)
       end do
-      call rk(rkcoeff(:,irk),n,dli,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f,dt,visc,p, &
-              is_forced,velf,bforce,gacc,beta,scalars,dudtrko,dvdtrko,dwdtrko,u,v,w,f)
-      call bulk_forcing(n,is_forced,f,u,v,w)
-      dpdl(:) = dpdl(:) + f(:)
+      if(is_bulk_forcing_wall_shear) then
+        tauo(:,:,:) = tau(:,:,:)
+        call cmpt_wallshear(n,nh_v,nh_g,is_forced,is_bound,l,dli,dzci,dzfi,visc,u,v,w,tau(:,:,1),tau(:,:,2),tau(:,:,3))
+      end if
+      call rk(rkcoeff(:,irk),n,nh_v,nh_p,nh_g,dli,dzci,dzfi,grid_vol_ratio_c,grid_vol_ratio_f,dt,visc,p, &
+              is_forced_rk,velf,bforce,gacc,beta,scalars,dudtrko,dvdtrko,dwdtrko,u,v,w,f)
       if(is_impdiff) then
         alpha = -.5*visc*dtrk
-        call solve_helmholtz(n,ng,hi,arrplanu,normfftu,alpha, &
+        call solve_helmholtz(n,nh_v,ng,hi,arrplanu,normfftu,alpha, &
                              lambdaxyu,au,bu,cu,rhsbu%x,rhsbu%y,rhsbu%z,is_bound,cbcvel(:,:,1),['f','c','c'],u)
-        call solve_helmholtz(n,ng,hi,arrplanv,normfftv,alpha, &
+        call solve_helmholtz(n,nh_v,ng,hi,arrplanv,normfftv,alpha, &
                              lambdaxyv,av,bv,cv,rhsbv%x,rhsbv%y,rhsbv%z,is_bound,cbcvel(:,:,2),['c','f','c'],v)
-        call solve_helmholtz(n,ng,hi,arrplanw,normfftw,alpha, &
+        call solve_helmholtz(n,nh_v,ng,hi,arrplanw,normfftw,alpha, &
                              lambdaxyw,aw,bw,cw,rhsbw%x,rhsbw%y,rhsbw%z,is_bound,cbcvel(:,:,3),['c','c','f'],w)
       end if
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.false.,dl,dzc,dzf,u,v,w)
-      call fillps(n,dli,dzfi,dtrki,u,v,w,pp)
-      call updt_rhs_b(['c','c','c'],cbcpre,n,is_bound,rhsbp%x,rhsbp%y,rhsbp%z,pp)
-      call solver(n,ng,arrplanp,normfftp,lambdaxyp,ap,bp,cp,cbcpre,['c','c','c'],pp,is_ptdma_update_p,ap_d,cp_d)
-      call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,pp)
-      call correc(n,dli,dzci,dtrk,pp,u,v,w)
-      call bounduvw(cbcvel,n,bcvel,nb,is_bound,.true.,dl,dzc,dzf,u,v,w)
-      call updatep(n,dli,dzci,dzfi,alpha,pp,p)
-      call boundp(cbcpre,n,bcpre,nb,is_bound,dl,dzc,p)
+      if(is_bulk_forcing_wall_shear) then
+        call bulk_forcing_wall_shear(irk,rkcoeff(:,irk),dt,n,nh_v,nh_g,ng,lo,l,dli,dzc,dzci,dzfi,dzci_g,dzfi_g, &
+                                     grid_vol_ratio_c,grid_vol_ratio_f,visc,is_bound,is_forced,velf,bforce,tau,tauo,u,v,w,f)
+      end if
+      dpdl(:) = dpdl(:) + f(:)
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w,.false.,-1)
+      call fillps(n,nh_v,nh_p,nh_g,dli,dzfi,dtrki,u,v,w,pp)
+      call updt_rhs_b(['c','c','c'],cbcpre,n,nh_p,is_bound,rhsbp%x,rhsbp%y,rhsbp%z,pp)
+      call solver(n,nh_p,ng,arrplanp,normfftp,lambdaxyp,ap,bp,cp,cbcpre,['c','c','c'],pp,is_dtdma_update_p,ap_d,cp_d, &
+                  .not.is_impdiff)
+      call boundp(cbcpre,n,nh_p,nh_g,bcpre,nb,is_bound,dl,dzc,pp)
+      call correc(n,nh_v,nh_p,nh_g,dli,dzci,dtrk,pp,u,v,w)
+      call bounduvw(cbcvel,n,nh_v,nh_g,bcvel,nb,is_bound,dl,dzc,dzf,u,v,w,.true.,1,0)
+      call updatep(n,nh_p,nh_g,dli,dzci,dzfi,alpha,pp,p)
+      call boundp(cbcpre,n,nh_p,nh_g,bcpre,nb,is_bound,dl,dzc,p,1)
     end do
     dpdl(:)     = -dpdl(:)*dti
     fs(1:nscal) = fs(1:nscal)*dti
@@ -486,59 +528,52 @@ program cans
     end if
     if(stop_type(3)) then ! maximum wall-clock time reached
       tw = (MPI_WTIME()-twi)/3600.
+      call MPI_ALLREDUCE(MPI_IN_PLACE,tw,1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierr)
       if(tw    >= tw_max  ) is_done = is_done.or..true.
     end if
     if(icheck > 0.and.mod(istep,max(icheck,1)) == 0) then
       if(myid == 0) print*, 'Checking stability and divergence...'
-      call chkdt(n,dl,dzci,dzfi,visc,alpha_max,u,v,w,dt_cfl)
+      call chkdt(n,nh_v,nh_g,dl,dzci,dzfi,visc,alpha_max,u,v,w,dt_cfl)
       dt = merge(dt_f,min(cfl*dt_cfl,dtmax),dt_f > 0.)
       if(myid == 0) print*, 'dt_cfl = ', dt_cfl, 'dt = ', dt
-      if(dt_cfl < small) then
-        if(myid == 0) print*, 'ERROR: time step is too small.'
+      dti = 1./dt
+      call chkdiv(lo,hi,nh_v,nh_g,l,dli,dzfi,u,v,w,divtot,divmax)
+      if(myid == 0) print*, 'Velocity divergence norms: Mean = ', divtot, '| Maximum = ', divmax
+      if((divmax > small.and..not.is_mask_divergence_check).or.is_nan(divtot)) then
+        if(myid == 0) print*, 'ERROR: maximum divergence is too large.'
         if(myid == 0) print*, 'Aborting...'
         is_done = .true.
         kill = .true.
-      end if
-      dti = 1./dt
-      call chkdiv(lo,hi,l,dli,dzfi,u,v,w,divtot,divmax)
-      if(myid == 0) print*, 'Velocity divergence norms: Mean = ', divtot, '| Maximum = ', divmax
-      if(.not.is_mask_divergence_check) then
-        if(divmax > small.or.is_nan(divtot)) then
-          if(myid == 0) print*, 'ERROR: maximum divergence is too large.'
-          if(myid == 0) print*, 'Aborting...'
-          is_done = .true.
-          kill = .true.
-        end if
       end if
     end if
     !
     ! output routines below
     !
-    if(iout0d > 0.and.mod(istep,max(iout0d,1)) == 0) then
+    if(is_output_due(istep,iout0d,tout0d,time_start,time)) then
       !allocate(var(4))
       var(1) = 1.*istep
       var(2) = dt
       var(3) = time
       call out0d(trim(datadir)//'time.out',3,var)
       !
-      if(any(is_forced(:)).or.any(abs(bforce(:)) > 0.)) then
+      if(any(abs(bforce(:)) > 0.).or.any(abs(dpdl(:)) > 0.)) then
         meanvelu = 0.
         meanvelv = 0.
         meanvelw = 0.
-        if(is_forced(1).or.abs(bforce(1)) > 0.) then
-          call bulk_mean(n,grid_vol_ratio_f,u,meanvelu)
+        if(abs(bforce(1)) > 0..or.abs(dpdl(1)) > 0.) then
+          call bulk_mean(n,nh_v,nh_g,grid_vol_ratio_f,u,meanvelu)
         end if
-        if(is_forced(2).or.abs(bforce(2)) > 0.) then
-          call bulk_mean(n,grid_vol_ratio_f,v,meanvelv)
+        if(abs(bforce(2)) > 0..or.abs(dpdl(2)) > 0.) then
+          call bulk_mean(n,nh_v,nh_g,grid_vol_ratio_f,v,meanvelv)
         end if
-        if(is_forced(3).or.abs(bforce(3)) > 0.) then
-          call bulk_mean(n,grid_vol_ratio_c,w,meanvelw)
+        if(abs(bforce(3)) > 0..or.abs(dpdl(3)) > 0.) then
+          call bulk_mean(n,nh_v,nh_g,grid_vol_ratio_c,w,meanvelw)
         end if
-        if(.not.any(is_forced(:))) dpdl(:) = -bforce(:) ! constant pressure gradient
         var(1)   = time
-        var(2:4) = dpdl(1:3)
-        var(5:7) = [meanvelu,meanvelv,meanvelw]
-        call out0d(trim(datadir)//'forcing.out',7,var)
+        var(2:4) = bforce(1:3)
+        var(5:7) = dpdl(1:3)
+        var(8:10) = [meanvelu,meanvelv,meanvelw]
+        call out0d(trim(datadir)//'forcing.out',10,var)
       end if
       !
       do iscal=1,nscal
@@ -546,7 +581,7 @@ program cans
         write(scalnum,'(i3.3)') iscal
         if(s%is_forced.or.abs(s%source) > 0.) then
           meanscal = 0.
-          call bulk_mean(n,grid_vol_ratio_f,s%val,meanscal)
+          call bulk_mean(n,nh_s,nh_g,grid_vol_ratio_f,s%val,meanscal)
           if(.not.s%is_forced) fs(:) = s%source
           var(1:3) = [time,fs(iscal),meanscal]
           call out0d(trim(datadir)//'forcing_s_'//scalnum//'.out',3,var)
@@ -554,7 +589,7 @@ program cans
       end do
     end if
     write(fldnum,'(i7.7)') istep
-    if(iout1d > 0.and.mod(istep,max(iout1d,1)) == 0) then
+    if(is_output_due(istep,iout1d,tout1d,time_start,time)) then
       !$acc wait
       !$acc update self(u,v,w,p)
       do iscal=1,nscal
@@ -562,7 +597,7 @@ program cans
       end do
       include 'out1d.h90'
     end if
-    if(iout2d > 0.and.mod(istep,max(iout2d,1)) == 0) then
+    if(is_output_due(istep,iout2d,tout2d,time_start,time)) then
       !$acc wait
       !$acc update self(u,v,w,p)
       do iscal=1,nscal
@@ -570,7 +605,7 @@ program cans
       end do
       include 'out2d.h90'
     end if
-    if(iout3d > 0.and.mod(istep,max(iout3d,1)) == 0) then
+    if(is_output_due(istep,iout3d,tout3d,time_start,time)) then
       !$acc wait
       !$acc update self(u,v,w,p)
       do iscal=1,nscal
@@ -578,20 +613,16 @@ program cans
       end do
       include 'out3d.h90'
     end if
-    if(isave > 0.and.((mod(istep,max(isave,1)) == 0).or.(is_done.and..not.kill))) then
-      if(is_overwrite_save) then
+    if((isave > 0.or.tsave > 0.).and.(.not.kill).and.(is_output_due(istep,isave,tsave,time_start,time).or.is_done)) then
+      if(is_overwrite_save.and.nsaves_max <= 0) then
         filename = 'fld'
       else
         filename = 'fld_'//fldnum
-        if(nsaves_max > 0) then
+        if(is_overwrite_save) then
           if(savecounter >= nsaves_max) savecounter = 0
           savecounter = savecounter + 1
           write(chkptnum,'(i4.4)') savecounter
           filename = 'fld_'//chkptnum
-          var(1) = 1.*istep
-          var(2) = time
-          var(3) = 1.*savecounter
-          call out0d(trim(datadir)//'log_checkpoints.out',3,var)
         end if
       end if
       !$acc wait
@@ -599,27 +630,40 @@ program cans
       do iscal=1,nscal
         !$acc update self(scalars(iscal)%val)
       end do
+      is_save_tmp = trim(io_ext) /= '.bp'
       do is=1,4+nscal
+        fname_save = trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext)
+        if(is_save_tmp) fname_save = trim(datadir)//'fld_'//trim(c_io_vars(is))//'.tmp'//trim(io_ext)
         select case(trim(c_io_vars(is)))
         case('u')
-          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
-                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+          call load_one('w',trim(fname_save), &
+                        MPI_COMM_WORLD,ng,nh_io(:,is),nh_g,lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
                         xf_g,yc_g,zc_g)
         case('v')
-          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
-                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+          call load_one('w',trim(fname_save), &
+                        MPI_COMM_WORLD,ng,nh_io(:,is),nh_g,lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
                         xc_g,yf_g,zc_g)
         case('w')
-          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
-                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+          call load_one('w',trim(fname_save), &
+                        MPI_COMM_WORLD,ng,nh_io(:,is),nh_g,lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
                         xc_g,yc_g,zf_g)
         case default
-          call load_one('w',trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
-                        MPI_COMM_WORLD,ng,[1,1,1],lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
+          call load_one('w',trim(fname_save), &
+                        MPI_COMM_WORLD,ng,nh_io(:,is),nh_g,lo,hi,io_vars(is)%arr,trim(c_io_vars(is)),time,istep, &
                         xc_g,yc_g,zc_g)
         end select
       end do
-      if(.not.is_overwrite_save) then
+      if(is_save_tmp) then
+        call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        if(myid == 0) then
+          do is=1,4+nscal
+            istat = rename_file(trim(datadir)//'fld_'//trim(c_io_vars(is))//'.tmp'//trim(io_ext), &
+                                trim(datadir)//trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext))
+            if(istat /= 0) print*, 'WARNING: could not rename the temporary checkpoint file of ', trim(c_io_vars(is)), '.'
+          end do
+        end if
+      end if
+      if(.not.is_overwrite_save.or.nsaves_max > 0) then
         !
         ! fld_*.<ext> -> last checkpoint file (symbolic link)
         !
@@ -627,6 +671,12 @@ program cans
           call gen_alias(myid,trim(datadir),trim(filename)//'_'//trim(c_io_vars(is))//trim(io_ext), &
                          'fld_'//trim(c_io_vars(is))//trim(io_ext))
         end do
+      end if
+      if(is_overwrite_save.and.nsaves_max > 0) then
+        var(1) = 1.*istep
+        var(2) = time
+        var(3) = 1.*savecounter
+        call out0d(trim(datadir)//'log_checkpoints.out',3,var)
       end if
       if(myid == 0) print*, '*** Checkpoint saved at time = ', time, 'time step = ', istep, '. ***'
     end if
@@ -655,4 +705,5 @@ program cans
   call cudecomp_finalize
 #endif
   call MPI_FINALIZE(ierr)
+  if(kill) error stop
 end program cans

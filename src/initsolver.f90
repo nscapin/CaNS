@@ -12,15 +12,16 @@ module mod_initsolver
   private
   public initsolver
   contains
-  subroutine initsolver(ng,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbc,bc,lambdaxy,c_or_f,a,b,c,arrplan,normfft, &
+  subroutine initsolver(ng,nh,n_x_fft,n_y_fft,lo_z,hi_z,dli,dzci_g,dzfi_g,cbc,bc,lambdaxy,c_or_f,a,b,c,arrplan,normfft, &
                         rhsbx,rhsby,rhsbz)
     !
     ! initializes the Poisson/Helmholtz solver
     !
     implicit none
     integer , intent(in), dimension(3) :: ng,n_x_fft,n_y_fft,lo_z,hi_z
+    integer , intent(in)               :: nh
     real(rp), intent(in), dimension(3 ) :: dli
-    real(rp), intent(in), dimension(0:) :: dzci_g,dzfi_g
+    real(rp), intent(in), dimension(1-nh:) :: dzci_g,dzfi_g
     character(len=1), intent(in), dimension(0:1,3) :: cbc
     real(rp)        , intent(in), dimension(0:1,3) :: bc
     real(rp), intent(out), dimension(lo_z(1):,lo_z(2):) :: lambdaxy
@@ -36,7 +37,7 @@ module mod_initsolver
     real(rp), intent(out), dimension(:,:,0:) :: rhsby
     real(rp), intent(out), dimension(:,:,0:) :: rhsbz
     real(rp), dimension(3)        :: dl
-    real(rp), dimension(0:ng(3)+1) :: dzc_g,dzf_g
+    real(rp), dimension(1-nh:ng(3)+nh) :: dzc_g,dzf_g
     integer :: i,j
     real(rp), dimension(ng(1))      :: lambdax
     real(rp), dimension(ng(2))      :: lambday
@@ -59,7 +60,7 @@ module mod_initsolver
     !
     ! compute and distribute coefficients for tridiagonal solver
     !
-    call tridmatrix(cbc(:,3),ng(3),dzci_g,dzfi_g,c_or_f(3),a_g,b_g,c_g)
+    call tridmatrix(cbc(:,3),ng(3),nh,dzci_g,dzfi_g,c_or_f(3),a_g,b_g,c_g)
     a(:) = a_g(lo_z(3):hi_z(3))
     b(:) = b_g(lo_z(3):hi_z(3))
     c(:) = c_g(lo_z(3):hi_z(3))
@@ -104,7 +105,7 @@ module mod_initsolver
         integer :: nh,iswap(n)
         nh = (n+1)/2
         iswap(1) = 1
-        iswap(2) = nh+(1-mod(n,2))
+        if(n > 1) iswap(2) = nh+(1-mod(n,2))
         do l=2,n-1
           if(l <= nh) then ! real eigenvalue
             iswap(2*l-1                  ) = l
@@ -121,9 +122,10 @@ module mod_initsolver
           lambda(l)   = -2.*(1.-cos((l-1  )*pi/(1.*n)))
         end do
       else if(c_or_f == 'f') then
-        do l=1,n
-          lambda(l)   = -2.*(1.-cos((l-1  )*pi/(1.*(n-1+1))))
+        do l=1,n-1 ! point at n is a dependent boundary value
+          lambda(l)   = -2.*(1.-cos((l-1  )*pi/(1.*(n-1))))
         end do
+        lambda(n) = 0.
       end if
     case('DD')
       if(     c_or_f == 'c') then
@@ -137,22 +139,38 @@ module mod_initsolver
         lambda(n) = 0.
       end if
     case('ND','DN')
-      do l=1,n
-        lambda(l)     = -2.*(1.-cos((2*l-1)*pi/(2.*n)))
-      end do
+      if(     c_or_f == 'c') then
+        do l=1,n
+          lambda(l)   = -2.*(1.-cos((2*l-1)*pi/(2.*n)))
+        end do
+      else if(c_or_f == 'f') then
+        do l=1,n-1 ! point at n is prescribed by the boundary condition
+          lambda(l)   = -2.*(1.-cos((2*l-1)*pi/(2.*n-1.)))
+        end do
+        lambda(n) = 0.
+      end if
     end select
   end subroutine eigenvalues
   !
-  subroutine tridmatrix(bc,n,dzci,dzfi,c_or_f,a,b,c)
+  subroutine tridmatrix(bc,n,nh,dzci,dzfi,c_or_f,a,b,c)
     implicit none
     character(len=1), intent(in), dimension(0:1) :: bc
     integer , intent(in) :: n
-    real(rp), intent(in), dimension(0:) :: dzci,dzfi
+    integer , intent(in) :: nh
+    real(rp), intent(in), dimension(1-nh:) :: dzci,dzfi
     character(len=1), intent(in) :: c_or_f ! c -> cell-centered; f-face-centered
     real(rp), intent(out), dimension(n) :: a,b,c
     integer :: k
     integer :: ibound
     real(rp), dimension(0:1) :: factor
+    !
+    if((n == 1).and.(bc(0)//bc(1) == 'PP')) then
+      a(:) = 0.
+      b(:) = 0.
+      c(:) = 0.
+      return
+    end if
+    !
     select case(c_or_f)
     case('c')
       do k=1,n
@@ -181,8 +199,8 @@ module mod_initsolver
       b(1) = b(1) + factor(0)*a(1)
       b(n) = b(n) + factor(1)*c(n)
     case('f')
-      if(bc(0) == 'N') b(1) = b(1) + factor(0)*a(1)
-      if(bc(1) == 'N') b(n) = b(n) + factor(1)*c(n)
+      if(bc(0) == 'N') b(1  ) = b(1  ) + factor(0)*a(1  )
+      if(bc(1) == 'N') b(n-1) = b(n-1) + factor(1)*c(n-1)
     end select
   end subroutine tridmatrix
   !

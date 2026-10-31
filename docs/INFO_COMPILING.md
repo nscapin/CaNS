@@ -8,7 +8,6 @@ The `Makefile` in the root directory is used to compile the code, and is expecte
 #
 # compiler and compiling profile
 #
-At present, the GPU-enabled path documented in this branch corresponds to the OpenACC implementation. The OpenMP GPU backend is being maintained in the [`openmp-port` branch](https://github.com/CaNS-World/CaNS/tree/openmp-port); see its [`docs/INFO_COMPILING.md`](https://github.com/CaNS-World/CaNS/blob/openmp-port/docs/INFO_COMPILING.md) for the OpenMP target offload build path.
 FCOMP=GNU          # options: GNU, NVIDIA, INTEL
 FFLAGS_OPT=1       # for production runs
 FFLAGS_OPT_MAX=0   # for production runs (more aggressive optimization)
@@ -23,7 +22,7 @@ USE_HDF5=0         # HDF5 I/O support
 USE_ADIOS2=0       # ADIOS2 I/O support
 ```
 
-In this file, `FCOMP` can be one of `GNU` (`gfortran`), `INTEL` (`ifort`), `NVIDIA` (`nvfortran`), or `CRAY` (`ftn`); the predefined profiles for compiler options can be selected by choosing one of the `FFLAGS_*` options; finer control of the compiler flags may be achieved by building with, e.g., `make FFLAGS+=[OTHER_FLAGS]`, or by tweaking the profiles directly under `configs/flags.mk`. Similarly, the library paths (e.g., for *FFTW*) may need to be adapted in the `Makefile` (`LIBS` variable) or by building with `make LIBS+='-L[PATH_TO_LIB] -l[NAME_OF_LIB]'`. Finally, the following pre-processing options are available:
+In this file, `FCOMP` can be one of `GNU` (`gfortran`), `INTEL` (`ifx`), `NVIDIA` (`nvfortran`), or `CRAY` (`ftn`); the predefined profiles for compiler options can be selected by choosing one of the `FFLAGS_*` options; finer control of the compiler flags may be achieved by building with, e.g., `make FFLAGS+=[OTHER_FLAGS]`, or by tweaking the profiles directly under `configs/flags.mk`. Similarly, the library paths (e.g., for *FFTW*) may need to be adapted in the `Makefile` (`LIBS` variable) or by building with `make LIBS+='-L[PATH_TO_LIB] -l[NAME_OF_LIB]'`. Finally, the following pre-processing options are available:
 
  * `SINGLE_PRECISION` : calculation will be carried out in single precision (the default precision is double)
  * `GPU`              : enable GPU accelerated runs
@@ -33,9 +32,11 @@ In this file, `FCOMP` can be one of `GNU` (`gfortran`), `INTEL` (`ifort`), `NVID
 
 At present, the GPU-enabled path documented in this branch corresponds to the OpenACC implementation. The OpenMP GPU backend (OpenMP target offload) is being maintained in the [`openmp-port` branch](https://github.com/CaNS-World/CaNS/tree/openmp-port); see its [`docs/INFO_COMPILING.md`](https://github.com/CaNS-World/CaNS/blob/openmp-port/docs/INFO_COMPILING.md) file for the OpenMP target offload build path.
 
+NVIDIA GPU builds generate code for the major compute capabilities selected by the compiler (`NVHPC_GPU_TARGET=ccall-major`). This can be overridden for a specific GPU, for example with `make NVHPC_GPU_TARGET=cc89`, or set to `ccnative` to target the GPUs visible on the build system.
+
 Typing `make libs` will build the 2DECOMP&FFT/cuDecomp/diezDecomp libraries; then typing `make` will compile the code and copy the executable `cans` to a `run/` folder; `make run` will also copy the default input files `*.in` under `src/` to the same `run/` folder.
 
-Note that cuDecomp needs to be dynamically linked before performing a GPU run. To do this, one should update the `LD_LIBRARY_PATH` environment variable as follows (from the root directory):
+The executable records the location of the cuDecomp (or hipDecomp) shared libraries, so a GPU run needs no further setup. If the `dependencies` folder is moved after the build, the libraries are found by updating the `LD_LIBRARY_PATH` environment variable instead, e.g. (from the root directory):
 ```shell
 export LD_LIBRARY_PATH=$PWD/dependencies/cuDecomp/build/lib:$LD_LIBRARY_PATH
 ```

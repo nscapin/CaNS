@@ -8,15 +8,21 @@ module mod_initmpi
   use mpi
   use decomp_2d
   use decomp_2d_constants, only: D2D_LOG_QUIET
-  use mod_common_mpi     , only: myid,ierr,halo,dinfo_ptdma
-  use mod_param          , only: ipencil => ipencil_axis,is_poisson_pcr_tdma
+  use mod_common_mpi     , only: myid,ierr,halo,dinfo_dtdma
+  use mod_param          , only: ipencil => ipencil_axis,is_poisson_dtdma
   use mod_types
 #if defined(_OPENACC)
   use openacc
-#if !defined(_USE_DIEZDECOMP)
-  use cudecomp
-#else
+#if defined(_USE_DIEZDECOMP)
   use diezdecomp
+#elif defined(_USE_HIP)
+  use hipdecomp
+#else
+  use cudecomp
+#endif
+#if defined(_USE_HIP)
+  use hipfort, only : cudaGetDevicecount => hipGetDevicecount, &
+                      cudaSetDevice      => hipSetDevice
 #endif
 #endif
   !@cuf use cudafor, only: cudaGetDeviceCount,cudaSetDevice
@@ -24,7 +30,7 @@ module mod_initmpi
   use mod_common_cudecomp, only: cudecomp_real_rp, &
                                  ch => handle,gd => gd_halo,gd_poi,gd_poi_io, &
                                  ap_x,ap_y,ap_z,ap_x_poi,ap_y_poi,ap_z_poi, &
-                                 gd_ptdma,ap_y_ptdma,ap_z_ptdma
+                                 gd_dtdma,ap_y_dtdma,ap_z_dtdma
   use mod_param, only: cudecomp_t_comm_backend     ,cudecomp_h_comm_backend    , &
                        cudecomp_is_t_comm_autotune ,cudecomp_is_h_comm_autotune, &
                        cudecomp_is_t_enable_nccl   ,cudecomp_is_h_enable_nccl  , &
@@ -37,23 +43,24 @@ module mod_initmpi
   integer, parameter :: CUDECOMP_RANK_NULL = -1
 #endif
   contains
-  subroutine initmpi(ng,dims,bc,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,nb,is_bound)
+  subroutine initmpi(ng,dims,bc,nh_max,lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z,nb,is_bound)
     implicit none
     integer, intent(in   ), dimension(3) :: ng
     integer, intent(inout), dimension(2) :: dims
     character(len=1), intent(in), dimension(0:1,3) :: bc
+    integer, intent(in   )                         :: nh_max
     integer, intent(out), dimension(3    ) :: lo,hi,n,n_x_fft,n_y_fft,lo_z,hi_z,n_z
     integer, intent(out), dimension(0:1,3) :: nb
     logical, intent(out), dimension(0:1,3) :: is_bound
     logical, dimension(3) :: periods
-    integer :: l,ipencil_t(2)
+    integer :: l,nh,ipencil_t(2)
 #if defined(_OPENACC)
     integer(acc_device_kind) ::dev_type
     integer :: local_comm,mydev,ndev
     integer :: istat
 #if !defined(_USE_DIEZDECOMP)
     type(cudecompGridDescConfig)          :: conf,conf_poi,conf_poi_io
-    type(cudecompGridDescConfig)          :: conf_ptdma
+    type(cudecompGridDescConfig)          :: conf_dtdma
     type(cudecompGridDescAutotuneOptions) :: atune_conf
 #else
     logical :: is_axis_contiguous(3)
@@ -69,15 +76,10 @@ module mod_initmpi
     call MPI_COMM_SPLIT_TYPE(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,local_comm,ierr)
     call MPI_COMM_RANK(local_comm,mydev,ierr)
     dev_type = acc_get_device_type()
-#if !defined(_USE_HIP)
     istat = cudaGetDeviceCount(ndev)      ! may be tweaked with environment variable CUDA_VISIBLE_DEVICES
     mydev = mod(mydev,ndev)
     istat = cudaSetDevice(mydev)
     if(istat /= 0) print*,'MPI rank: ',myid,' error assigning GPU: ',mydev
-#else
-    ndev  = acc_get_num_devices(dev_type) ! may be tweaked with environment variable ACC_DEVICE_NUM
-    mydev = mod(mydev,ndev)
-#endif
     call acc_set_device_num(mydev,dev_type)
     call acc_init(dev_type)
     !
@@ -121,7 +123,7 @@ module mod_initmpi
       atune_conf%transpose_op_weights(3) = 2. ! multiplier for Z-to-Y transpose timings
       atune_conf%transpose_op_weights(4) = 2. ! multiplier for Y-to-X transpose timings
     end select
-    if(is_poisson_pcr_tdma) then
+    if(is_poisson_dtdma) then
       atune_conf%transpose_op_weights(2) = atune_conf%transpose_op_weights(2) - 1.
       atune_conf%transpose_op_weights(3) = atune_conf%transpose_op_weights(3) - 1.
     end if
@@ -136,13 +138,13 @@ module mod_initmpi
     conf_poi_io%gdims(:) = ng(:)
     istat = cudecompGridDescCreate(ch,gd_poi_io,conf_poi_io)
     dims(:) = conf%pdims(:)
-    if(is_poisson_pcr_tdma) then
-      istat = cudecompGridDescConfigSetDefaults(conf_ptdma)
-      conf_ptdma%transpose_comm_backend = conf_poi%transpose_comm_backend
-      conf_ptdma%transpose_axis_contiguous(:) = .false.
-      conf_ptdma%gdims(:) = [ng(1),ng(2),2*dims(2)]
-      conf_ptdma%pdims(:) = dims(:)
-      istat = cudecompGridDescCreate(ch,gd_ptdma,conf_ptdma)
+    if(is_poisson_dtdma) then
+      istat = cudecompGridDescConfigSetDefaults(conf_dtdma)
+      conf_dtdma%transpose_comm_backend = conf_poi%transpose_comm_backend
+      conf_dtdma%transpose_axis_contiguous(:) = .false.
+      conf_dtdma%gdims(:) = [ng(1),ng(2),2*dims(2)]
+      conf_dtdma%pdims(:) = dims(:)
+      istat = cudecompGridDescCreate(ch,gd_dtdma,conf_dtdma)
     end if
     !
     ! setup descriptor for halo exchanges
@@ -153,15 +155,18 @@ module mod_initmpi
     conf%halo_comm_backend = cudecomp_h_comm_backend
     conf%transpose_axis_contiguous(:) = .false.
     istat = cudecompGridDescAutotuneOptionsSetDefaults(atune_conf)
-    atune_conf%halo_extents(:) = 1
+    atune_conf%halo_extents(:) = nh_max
     atune_conf%halo_periods(:) = periods(:)
     atune_conf%dtype = cudecomp_real_rp
     atune_conf%autotune_halo_backend = cudecomp_is_h_comm_autotune
     atune_conf%disable_nccl_backends    = .not.cudecomp_is_t_enable_nccl
     atune_conf%disable_nvshmem_backends = .not.cudecomp_is_t_enable_nvshmem
     if(all(conf_poi%transpose_comm_backend /= [CUDECOMP_TRANSPOSE_COMM_NVSHMEM, &
-                                               CUDECOMP_TRANSPOSE_COMM_NVSHMEM_PL, &
-                                               CUDECOMP_TRANSPOSE_COMM_NVSHMEM_SM])) then
+                                               CUDECOMP_TRANSPOSE_COMM_NVSHMEM_PL &
+#if !defined(_USE_HIP)
+                                             , CUDECOMP_TRANSPOSE_COMM_NVSHMEM_SM &
+#endif
+                                               ])) then
       !
       ! disable NVSHMEM halo backend autotuning when NVSHMEM is NOT used for transposes
       !
@@ -177,8 +182,8 @@ module mod_initmpi
     gd_poi%abs_reorder(:,:,0) = 1
     gd_poi%abs_reorder(:,:,1) = 0
     gd_poi%abs_reorder(:,:,2) = 2
-    if(is_poisson_pcr_tdma) then
-      call diezDecompGridDescCreate(gd_ptdma,dims,[ng(1),ng(2),2*dims(2)],[ng(1),ng(2),2*dims(2)],[.false.,.false.,.false.],periods,ipencil)
+    if(is_poisson_dtdma) then
+      call diezDecompGridDescCreate(gd_dtdma,dims,[ng(1),ng(2),2*dims(2)],[ng(1),ng(2),2*dims(2)],[.false.,.false.,.false.],periods,ipencil)
     end if
     is_axis_contiguous(:) = .true.; is_axis_contiguous(ipencil) = .false.
     call diezdecompGridDescCreate(gd_poi_io,dims,ng,ng,is_axis_contiguous,periods,ipencil)
@@ -186,8 +191,8 @@ module mod_initmpi
 #endif
     decomp_log = D2D_LOG_QUIET
     call decomp_2d_init(ng(1),ng(2),ng(3),dims(1),dims(2),periods)
-    if(is_poisson_pcr_tdma) then
-      call decomp_info_init(ng(1),ng(2),2*dims(2),dinfo_ptdma)
+    if(is_poisson_dtdma) then
+      call decomp_info_init(ng(1),ng(2),2*dims(2),dinfo_dtdma)
     end if
     ipencil_t(:) = pack([1,2,3],[1,2,3] /= ipencil)
     is_bound(:,:) = .false.
@@ -201,10 +206,10 @@ module mod_initmpi
     istat = cudecompGetPencilInfo(ch,gd_poi,ap_x_poi,1)
     istat = cudecompGetPencilInfo(ch,gd_poi,ap_y_poi,2)
     istat = cudecompGetPencilInfo(ch,gd_poi,ap_z_poi,3)
-    if(is_poisson_pcr_tdma) then
+    if(is_poisson_dtdma) then
       ap_z  = ap_y
-      istat = cudecompGetPencilInfo(ch,gd_ptdma,ap_y_ptdma,2)
-      istat = cudecompGetPencilInfo(ch,gd_ptdma,ap_z_ptdma,3)
+      istat = cudecompGetPencilInfo(ch,gd_dtdma,ap_y_dtdma,2)
+      istat = cudecompGetPencilInfo(ch,gd_dtdma,ap_z_dtdma,3)
     end if
     select case(ipencil)
     case(1)
@@ -249,7 +254,7 @@ module mod_initmpi
     n(:)       = hi(:)-lo(:)+1
     n_x_fft(:) = xsize(:)
     n_y_fft(:) = ysize(:)
-    if(.not.is_poisson_pcr_tdma) then
+    if(.not.is_poisson_dtdma) then
       lo_z(:) = zstart(:)
       hi_z(:) = zend(:)
       n_z(:)  = zsize(:)
@@ -258,8 +263,11 @@ module mod_initmpi
       hi_z(:) = yend(:)
       n_z(:)  = ysize(:)
     end if
-    do l=1,3
-      call makehalo(l,1,n(:),halo(l))
+    allocate(halo(3,nh_max))
+    do nh=1,nh_max
+      do l=1,3
+        call makehalo(l,nh,n(:),halo(l,nh))
+      end do
     end do
     nb(:,ipencil) = MPI_PROC_NULL
     call MPI_CART_SHIFT(comm_cart,0,1,nb(0,ipencil_t(1)),nb(1,ipencil_t(1)),ierr)
@@ -267,7 +275,7 @@ module mod_initmpi
     where(nb(:,:) == MPI_PROC_NULL) is_bound(:,:) = .true.
 #endif
 #if defined(_OPENACC)
-    if(is_poisson_pcr_tdma) then
+    if(is_poisson_dtdma) then
       !
       ! generate global coefficient arrays a(1:ng(3)), b(1:ng(3)), c(1:ng(3)) under initsolver
       !
@@ -283,16 +291,10 @@ module mod_initmpi
     integer, intent(in ) :: idir,nh
     integer, intent(in ), dimension(3) :: n
     integer, intent(out) :: halo
-    integer, dimension(3) :: nn
+    integer, dimension(3) :: nn,nn_halo
     nn(:) = n(:) + 2*nh
-    select case(idir)
-    case(1)
-      call MPI_TYPE_VECTOR(nn(2)*nn(3),nh            ,nn(1)            ,MPI_REAL_RP,halo,ierr)
-    case(2)
-      call MPI_TYPE_VECTOR(      nn(3),nh*nn(1)      ,nn(1)*nn(2)      ,MPI_REAL_RP,halo,ierr)
-    case(3)
-      call MPI_TYPE_VECTOR(          1,nh*nn(1)*nn(2),nn(1)*nn(2)*nn(3),MPI_REAL_RP,halo,ierr)
-    end select
+    nn_halo(:) = nn(:); nn_halo(idir) = nh
+    call MPI_TYPE_CREATE_SUBARRAY(3,nn,nn_halo,[0,0,0],MPI_ORDER_FORTRAN,MPI_REAL_RP,halo,ierr)
     call MPI_TYPE_COMMIT(halo,ierr)
   end subroutine makehalo
 end module mod_initmpi
